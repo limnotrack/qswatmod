@@ -4,19 +4,21 @@ swatmf.preprocessing.modflow
 Pure-Python helpers for reading and writing MODFLOW-related files that are
 part of the SWAT-MODFLOW pre-processing workflow.
 
-The functions here mirror the file-I/O logic in
-``pyfolder/modflow_functions.py`` without any dependency on QGIS, PyQt, or
-the ``processing`` module.  Geospatial operations (creating/selecting
-shapefile features, spatial intersections) must still be performed in QGIS
-or via a library such as GeoPandas/Shapely.
+Where possible the functions delegate to `flopy <https://flopy.readthedocs.io>`_
+for robust, format-aware I/O.  Manual text parsing is kept as a lightweight
+fallback for the few cases where the full flopy model-load overhead would be
+unnecessary.
 
 Functions exposed
 -----------------
-parse_dis_file         — Parse a MODFLOW discretisation (.dis) file.
+parse_dis_file         — Parse a MODFLOW discretisation (.dis) file via flopy.
 grid_row_col           — Build full (row, col) arrays for every grid cell.
 parse_riv_file         — Parse a MODFLOW river-package (.riv) file.
 write_riv_file         — Overwrite a MODFLOW river-package (.riv) file.
+compute_riv_params     — Derive RIV parameters from a ``river_grid`` table.
 create_modflow_obs     — Write the ``modflow.obs`` observation file.
+read_modflow_obs       — Read an existing ``modflow.obs`` into a DataFrame.
+create_mf_model        — Build a new MODFLOW model from scratch using flopy.
 create_modflow_mfn     — Generate ``modflow.mfn`` from the MODFLOW name file.
 modify_modflow_oc      — Update unit numbers in the MODFLOW output-control file.
 """
@@ -27,8 +29,10 @@ import csv
 import datetime
 import glob
 import os
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
+import flopy
+import flopy.modflow as fm
 import numpy as np
 import pandas as pd
 
@@ -114,12 +118,17 @@ def _find_single_file(folder: str, extension: str) -> str:
 # ---------------------------------------------------------------------------
 
 def parse_dis_file(swatmf_folder: str | os.PathLike) -> DisInfo:
-    """Parse the MODFLOW discretisation (``.dis``) file.
+    """Parse the MODFLOW discretisation (``.dis``) file using flopy.
+
+    flopy handles the full range of MODFLOW-2005 free-format DIS syntax
+    (INTERNAL / CONSTANT / EXTERNAL arrays, comment lines, etc.), making
+    this more robust than manual text parsing.
 
     Parameters
     ----------
     swatmf_folder : str or path-like
-        SWAT-MODFLOW working directory (contains the ``.dis`` file).
+        SWAT-MODFLOW working directory (contains the ``.dis`` file and the
+        corresponding ``.nam`` name file).
 
     Returns
     -------
@@ -129,16 +138,48 @@ def parse_dis_file(swatmf_folder: str | os.PathLike) -> DisInfo:
 
     Notes
     -----
-    The parser assumes the standard free-format MODFLOW-2005 DIS layout:
-
-    * Line 0 (after comments): ``NLAY NROW NCOL NPER ITMUNI LENUNI``
-    * Line 1: ``LAYCBD``
-    * Line 2: ``DELR`` (row widths — constant or array keyword)
-    * Line 3: ``DELC`` (column widths — constant or array keyword)
-    * Lines 4+: ``TOP`` elevations (array keyword + values)
+    flopy needs the MODFLOW name (``.nam``) file to load the model.  If no
+    ``.nam`` file is found the function falls back to lightweight manual
+    parsing of the ``.dis`` file.
     """
-    path = _find_single_file(str(swatmf_folder), ".dis")
-    with open(path, "r") as fh:
+    wd = str(swatmf_folder)
+    dis_path = _find_single_file(wd, ".dis")
+
+    # --- flopy-based load (preferred) -----------------------------------------
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    if nam_files:
+        mf_name = os.path.splitext(os.path.basename(nam_files[0]))[0]
+        try:
+            mf = fm.Modflow.load(
+                mf_name + ".nam",
+                model_ws=wd,
+                load_only=["dis"],
+                check=False,
+                verbose=False,
+            )
+            dis = mf.get_package("DIS")
+            nrow = int(dis.nrow)
+            ncol = int(dis.ncol)
+            # delr / delc may be scalar or array — take first value
+            delr = float(np.asarray(dis.delr.array).flat[0])
+            delc = float(np.asarray(dis.delc.array).flat[0])
+            top_elevs = np.asarray(dis.top.array).flatten().tolist()
+            # steady is a boolean array, one entry per stress period
+            transient = bool(not np.all(dis.steady.array))
+            return DisInfo(
+                nrow=nrow,
+                ncol=ncol,
+                delr=delr,
+                delc=delc,
+                n_cells=nrow * ncol,
+                top_elevs=top_elevs,
+                transient=transient,
+            )
+        except Exception:
+            pass  # fall through to manual parse
+
+    # --- Manual fallback (no .nam file, or flopy load failed) -----------------
+    with open(dis_path, "r") as fh:
         data = [
             line.replace("\n", "").split()
             for line in fh
@@ -148,7 +189,6 @@ def parse_dis_file(swatmf_folder: str | os.PathLike) -> DisInfo:
     nrow = int(data[0][1])
     ncol = int(data[0][2])
 
-    # DELR and DELC — handle both "INTERNAL" keyword and direct value
     if data[2][0].upper() == "INTERNAL":
         delr = float(data[3][1])
         delc = float(data[4][1])
@@ -158,14 +198,12 @@ def parse_dis_file(swatmf_folder: str | os.PathLike) -> DisInfo:
         delc = float(data[3][1])
         elev_start = 4
 
-    # TOP elevations: read until the next "INTERNAL" keyword
     top_elevs: list[float] = []
     ii = elev_start
     while ii < len(data) and data[ii][0].upper() != "INTERNAL":
         top_elevs.extend(float(v) for v in data[ii])
         ii += 1
 
-    # Check steady-state vs transient from the DIS header (field index 3 is NPER info)
     transient = any(
         row[3].upper() == "TR"
         for row in data
@@ -221,7 +259,10 @@ def grid_row_col(dis: DisInfo) -> tuple[list[int], list[int]]:
 # ---------------------------------------------------------------------------
 
 def parse_riv_file(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
-    """Parse the MODFLOW river-package (``.riv``) file.
+    """Parse the MODFLOW river-package (``.riv``) file via flopy.
+
+    flopy is used when a ``.nam`` file is available; otherwise the function
+    falls back to lightweight manual text parsing.
 
     Parameters
     ----------
@@ -232,9 +273,38 @@ def parse_riv_file(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
     -------
     pd.DataFrame
         Columns: ``layer``, ``row``, ``col``, ``stage``, ``cond``, ``rbot``.
-        One row per river cell.
+        One row per river cell (all stress-period data from period 0).
     """
-    path = _find_single_file(str(swatmf_folder), ".riv")
+    wd = str(swatmf_folder)
+
+    # --- flopy-based load (preferred) -----------------------------------------
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    if nam_files:
+        mf_name = os.path.splitext(os.path.basename(nam_files[0]))[0]
+        try:
+            mf = fm.Modflow.load(
+                mf_name + ".nam",
+                model_ws=wd,
+                load_only=["riv"],
+                check=False,
+                verbose=False,
+            )
+            riv_pkg = mf.get_package("RIV")
+            if riv_pkg is not None:
+                # stress_period_data[0] is a recarray with fields
+                # layer, row, col, stage, cond, rbot (0-based indices)
+                spd = riv_pkg.stress_period_data[0]
+                df = pd.DataFrame(spd)
+                # Convert to 1-based to match the rest of this module
+                df["layer"] = df["layer"] + 1
+                df["row"]   = df["row"]   + 1
+                df["col"]   = df["col"]   + 1
+                return df[["layer", "row", "col", "stage", "cond", "rbot"]]
+        except Exception:
+            pass  # fall through to manual parse
+
+    # --- Manual fallback ------------------------------------------------------
+    path = _find_single_file(wd, ".riv")
     with open(path, "r") as fh:
         data = [
             line.replace("\n", "").split()
@@ -244,7 +314,6 @@ def parse_riv_file(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
 
     n_riv = int(data[0][0])
     records = []
-    # The first two data rows are header rows; river cells start at index 2
     for i in range(2, n_riv + 2):
         row = data[i]
         records.append(
@@ -479,25 +548,218 @@ def read_modflow_obs(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
     with open(path, "r") as fh:
         for line in fh:
             stripped = line.strip()
-            if stripped.startswith("#") or not stripped:
+            if not stripped or stripped.startswith("#"):
                 continue
             parts = stripped.split()
+            # Skip the count header — it has fewer than 5 numeric-looking tokens
             if len(parts) < 5:
                 continue
+            # The data rows have exactly 5 numeric fields (the rest is a comment)
             try:
-                int(parts[0])  # first token must be a number (row)
-            except ValueError:
+                row_val  = int(parts[0])
+                col_val  = int(parts[1])
+                lay_val  = int(parts[2])
+                gid_val  = int(parts[3])
+                elev_val = float(parts[4])
+            except (ValueError, IndexError):
                 continue
             rows.append(
                 {
-                    "row":      int(parts[0]),
-                    "col":      int(parts[1]),
-                    "layer":    int(parts[2]),
-                    "grid_id":  int(parts[3]),
-                    "top_elev": float(parts[4]),
+                    "row":      row_val,
+                    "col":      col_val,
+                    "layer":    lay_val,
+                    "grid_id":  gid_val,
+                    "top_elev": elev_val,
                 }
             )
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# Create a new MODFLOW model from scratch using flopy
+# ---------------------------------------------------------------------------
+
+def create_mf_model(
+    mf_folder: str | os.PathLike,
+    mf_name: str,
+    top_elev: np.ndarray,
+    bot_elev: np.ndarray,
+    delr: float,
+    delc: float,
+    hk: Union[float, np.ndarray],
+    ss: Union[float, np.ndarray],
+    sy: Union[float, np.ndarray],
+    initial_head: Union[float, np.ndarray],
+    riv_df: pd.DataFrame,
+    sim_duration: int,
+    *,
+    vka: float = 0.1,
+    laytype: int = 1,
+    evt: Optional[Union[float, np.ndarray]] = None,
+    rch: float = 0.0,
+    ibound: Optional[np.ndarray] = None,
+    nodata: float = -9999.0,
+    headtol: float = 0.1,
+    fluxtol: float = 500.0,
+    maxiterout: int = 1000,
+) -> flopy.modflow.Modflow:
+    """Build a new MODFLOW-NWT model using flopy and write its input files.
+
+    This replicates the ``writeMFmodel`` function in ``pyfolder/writeMF.py``
+    without any QGIS / PyQt dependency.  All spatial data (elevation arrays,
+    river-cell table, etc.) must be supplied as numpy arrays or DataFrames —
+    typically loaded from GeoTIFF rasters or GeoPackage files.
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        Directory where the MODFLOW input files will be written (the
+        SWAT-MODFLOW working directory).
+    mf_name : str
+        Base name for the MODFLOW model (used for all generated file names).
+    top_elev : np.ndarray, shape (nrow, ncol)
+        Land-surface elevation array [length units of model].
+    bot_elev : np.ndarray, shape (nrow, ncol)
+        Aquifer bottom elevation array.
+    delr : float
+        Cell width along rows (y-spacing) [length units].
+    delc : float
+        Cell width along columns (x-spacing) [length units].
+    hk : float or np.ndarray
+        Horizontal hydraulic conductivity [length/time].  A scalar applies
+        the same value to every cell.
+    ss : float or np.ndarray
+        Specific storage [1/length].
+    sy : float or np.ndarray
+        Specific yield [dimensionless].
+    initial_head : float or np.ndarray
+        Initial hydraulic head [length units].
+    riv_df : pd.DataFrame
+        River-package cell data.  Must contain columns ``layer``, ``row``,
+        ``col``, ``riv_stage``, ``riv_cond``, ``riv_bot``.  Use
+        :func:`compute_riv_params` to derive these from ``river_grid``
+        attributes.
+    sim_duration : int
+        Total simulation duration [days].  Adding ~100 days is recommended
+        to account for leap years (matches the plugin convention).
+    vka : float, optional
+        Vertical anisotropy ratio (VKA in UPW package).  Default 0.1.
+    laytype : int, optional
+        Layer type: 0 = confined, 1 = convertible.  Default 1.
+    evt : float or np.ndarray, optional
+        Evapotranspiration rate.  If ``None`` the EVT package is omitted.
+    rch : float, optional
+        Background recharge rate [length/time].  SWAT-MODFLOW overrides this
+        at run time; the default of 0 is appropriate.
+    ibound : np.ndarray, optional
+        IBOUND array.  If ``None`` it is derived from *top_elev* using
+        *nodata* as the no-data sentinel value.
+    nodata : float, optional
+        No-data value in the elevation arrays.  Default ``-9999.0``.
+    headtol : float, optional
+        NWT solver head tolerance.  Default 0.1.
+    fluxtol : float, optional
+        NWT solver flux tolerance.  Default 500.
+    maxiterout : int, optional
+        Maximum outer iterations for NWT solver.  Default 1000.
+
+    Returns
+    -------
+    flopy.modflow.Modflow
+        The constructed (and written) flopy model object.
+
+    Examples
+    --------
+    >>> import numpy as np, rasterio
+    >>> with rasterio.open("top_elev.tif") as src:
+    ...     top = src.read(1).astype(float)
+    ...     delc = src.res[0]
+    ...     delr = src.res[1]
+    >>> with rasterio.open("bot_elev.tif") as src:
+    ...     bot = src.read(1).astype(float)
+    >>> mf = create_mf_model(
+    ...     mf_folder=wd, mf_name="mymodel",
+    ...     top_elev=top, bot_elev=bot,
+    ...     delr=delr, delc=delc,
+    ...     hk=5.0, ss=1e-4, sy=0.2,
+    ...     initial_head=top - 2.0,
+    ...     riv_df=riv_params,
+    ...     sim_duration=365,
+    ... )
+    """
+    wd = str(mf_folder)
+    nrow, ncol = top_elev.shape
+
+    # IBOUND: 1 where data exists, 0 where nodata
+    if ibound is None:
+        ibound_arr = np.where(top_elev != nodata, 1, 0).astype(np.int32)
+    else:
+        ibound_arr = np.asarray(ibound, dtype=np.int32)
+
+    # Build flopy model object
+    mf = fm.Modflow(mf_name, model_ws=wd, version="mfnwt")
+
+    # DIS package — single layer, transient, daily time steps
+    fm.ModflowDis(
+        mf,
+        nlay=1,
+        nrow=nrow,
+        ncol=ncol,
+        delr=delr,
+        delc=delc,
+        top=top_elev,
+        botm=bot_elev,
+        itmuni=4,           # 4 = days
+        perlen=sim_duration,
+        nstp=sim_duration,
+        steady=False,
+    )
+
+    # BAS package — boundary conditions + initial head
+    fm.ModflowBas(mf, ibound=ibound_arr, strt=initial_head)
+
+    # NWT solver
+    fm.ModflowNwt(
+        mf,
+        headtol=headtol,
+        fluxtol=fluxtol,
+        maxiterout=maxiterout,
+        Continue=False,
+        iprnwt=1,
+        linmeth=2,
+    )
+
+    # UPW package — hydraulic properties
+    fm.ModflowUpw(mf, hk=hk, ss=ss, sy=sy, vka=vka, laytyp=laytype)
+
+    # EVT package (optional)
+    if evt is not None:
+        fm.ModflowEvt(mf, nevtop=3, evtr=evt)
+
+    # RIV package — convert 1-based row/col to 0-based for flopy
+    riv_sorted = riv_df.sort_values(
+        riv_df.columns.intersection(["grid_id", "row"]).tolist() or riv_df.columns[:1].tolist()
+    )
+    riv_array = np.column_stack([
+        riv_sorted.get("layer", pd.Series(np.ones(len(riv_sorted), dtype=int))).values - 1,
+        riv_sorted["row"].values - 1,
+        riv_sorted["col"].values - 1,
+        riv_sorted["riv_stage"].values.astype(float),
+        riv_sorted["riv_cond"].values.astype(float),
+        riv_sorted["riv_bot"].values.astype(float),
+    ])
+    fm.ModflowRiv(mf, stress_period_data={0: riv_array})
+
+    # RCH package — background recharge (SWAT overrides at run time)
+    fm.ModflowRch(mf, rech=rch)
+
+    # OC package
+    fm.ModflowOc(mf, ihedfm=1)
+
+    # Write all input files
+    mf.write_input()
+
+    return mf
 
 
 # ---------------------------------------------------------------------------
