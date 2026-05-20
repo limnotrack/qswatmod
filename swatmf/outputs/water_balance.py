@@ -92,6 +92,11 @@ def read_output_std(
         filtered.append(line)
 
     # --- remove duplicate-month artefacts from daily output -----------------
+    # Threshold used to distinguish a genuine day-1 (start of a new period)
+    # from a duplicate month artefact: if the previous day number is more than
+    # this many days before day 1 of the next row, the row is a duplicate.
+    _DUP_MONTH_THRESHOLD = 20
+
     if iprint == 1:
         clean: list[str] = []
         for i, line in enumerate(filtered):
@@ -104,7 +109,7 @@ def read_output_std(
                 continue
             if i > 0 and clean:
                 prev_day = int(clean[-1].split()[0])
-                if day == 1 and (prev_day - day) > 20:
+                if day == 1 and (prev_day - day) > _DUP_MONTH_THRESHOLD:
                     continue
                 if day < prev_day and day != 1:
                     continue

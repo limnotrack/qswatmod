@@ -318,8 +318,9 @@ def export_streamflow(
         Absolute path to the written file.
     """
     from datetime import datetime as _dt
+    from swatmf import _EXPORT_VERSION
 
-    version = "version 2.10.1."
+    version = _EXPORT_VERSION
     ctime = _dt.now().strftime("- %m/%d/%y %H:%M:%S -")
     fname = f"swatmf_reach({subbasin})_obd({obd_col})_{timescale.lower()}.txt"
     fpath = os.path.join(str(out_folder), fname)

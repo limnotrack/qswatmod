@@ -26,7 +26,8 @@ class SimPeriod(NamedTuple):
     start_date_warmup : datetime.datetime
         First calendar date after the warmup period has been skipped.
     end_date_warmup : datetime.datetime
-        Last calendar date after the warmup period has been accounted for.
+        Last calendar date of the effective simulation (i.e. ``end_date``
+        minus the number of warm-up years that were skipped from the output).
     skipyear : int
         Number of warm-up years skipped (``NYSKIP`` in file.cio).
     iprint : int

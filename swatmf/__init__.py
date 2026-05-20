@@ -20,6 +20,10 @@ outputs/gwsw         : read swatmf_out_MF_gwsw* files
 outputs/water_balance: read output.std
 """
 
+__version__ = "0.1.0"
+# Version string used in exported file headers to match the QSWATMOD2 plugin convention
+_EXPORT_VERSION = "version 2.10.1."
+
 from .paths import Paths
 from .sim_period import parse_file_cio
 

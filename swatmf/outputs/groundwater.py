@@ -319,8 +319,9 @@ def export_groundwater(
         Absolute path to the written file.
     """
     from datetime import datetime as _dt
+    from swatmf import _EXPORT_VERSION
 
-    version = "version 2.10.1."
+    version = _EXPORT_VERSION
     ctime = _dt.now().strftime("- %m/%d/%y %H:%M:%S -")
     fname = f"swatmf_gw({grid_id})_obd({obd_col})_{timescale.lower()}.txt"
     fpath = os.path.join(str(out_folder), fname)
@@ -333,12 +334,14 @@ def export_groundwater(
         )
         fh.write("\n# Statistics\n")
         if stats is not None:
+            fh.write(f"Nash-Sutcliffe: {stats['nse']:.4f}\n")
             fh.write(f"R-squared: {stats['rsq']:.4f}\n")
-            fh.write(f"RMSE: {stats['rmse']:.4f}\n")
             fh.write(f"PBIAS: {stats['pbias']:.4f}\n")
+            fh.write(f"RMSE: {stats['rmse']:.4f}\n")
         else:
+            fh.write("Nash-Sutcliffe: ---\n")
             fh.write("R-squared: ---\n")
-            fh.write("RMSE: ---\n")
             fh.write("PBIAS: ---\n")
+            fh.write("RMSE: ---\n")
 
     return fpath
