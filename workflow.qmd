@@ -1,0 +1,467 @@
+---
+title: "SWAT-MODFLOW Scripted Post-Processing Workflow"
+subtitle: "Using the `swatmf` Python package"
+author: ""
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    fig-width: 12
+    fig-height: 4
+    embed-resources: true
+jupyter: python3
+---
+
+## Introduction
+
+This document walks through a scripted post-processing workflow for
+[SWAT-MODFLOW](https://swat.tamu.edu/software/swat-modflow/) results that
+mirrors the analysis steps performed by the **QSWATMOD2** QGIS plugin, but
+runs entirely in Python — no QGIS installation required.
+
+The workflow is implemented in the `swatmf` package bundled with this
+repository.  Install it (once) from the project root:
+
+```bash
+pip install -e .
+```
+
+The sections below follow the same tabs as the QSWATMOD2 plugin:
+
+1. **Setup** — paths and simulation period
+2. **Streamflow** — `output.rch`
+3. **Groundwater Levels** — `swatmf_out_MF_obs`
+4. **MODFLOW Recharge** — `swatmf_out_MF_recharge*`
+5. **GW–SW Exchange** — `swatmf_out_MF_gwsw*`
+6. **Water Balance** — `output.std`
+7. **Performance Metrics Summary**
+
+---
+
+## 1  Setup
+
+### 1.1  Project paths
+
+```{python}
+from swatmf import Paths, parse_file_cio
+
+# ── Edit these two variables to point at your project ──────────────────────
+PROJECT_DIR  = "/path/to/your/qgis/project/folder"
+PROJECT_NAME = "your_project_name"
+# ───────────────────────────────────────────────────────────────────────────
+
+paths = Paths(PROJECT_DIR, PROJECT_NAME)
+wd    = paths.swatmf_folder          # SWAT-MODFLOW working directory
+out   = paths.exported_files         # where output files are written
+
+print("SWAT-MODFLOW folder :", wd)
+print("Exported files folder:", out)
+```
+
+### 1.2  Simulation period
+
+The simulation dates are read from `file.cio`.
+
+```{python}
+sp = parse_file_cio(wd)
+
+print(f"Simulation start  : {sp.start_date.date()}")
+print(f"Simulation end    : {sp.end_date.date()}")
+print(f"Warm-up start     : {sp.start_date_warmup.date()}")
+print(f"Warm-up end       : {sp.end_date_warmup.date()}")
+print(f"Warm-up years     : {sp.skipyear}")
+print(f"SWAT iprint code  : {sp.iprint}  "
+      f"({'daily' if sp.iprint==1 else 'monthly' if sp.iprint==0 else 'annual'})")
+```
+
+```{python}
+# Convenience date strings used throughout
+start_str  = sp.start_date_warmup.strftime("%m/%d/%Y")    # for pandas date_range
+start_mdy  = sp.start_date.strftime("%m-%d-%Y")           # for Julian-day conversion
+end_year   = sp.end_date.year
+iprint     = sp.iprint
+```
+
+---
+
+## 2  Streamflow
+
+Simulated stream discharge is read from `output.rch`.  Observed data (if
+available) should be placed in a CSV file named `stf_<subbasin>.obd.csv` in
+the SWAT-MODFLOW folder.
+
+```{python}
+import glob, os
+from swatmf.outputs.streamflow import (
+    get_streamflow, compute_statistics, plot_streamflow, export_streamflow
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+SUBBASIN   = 1          # subbasin number to inspect
+TIMESCALE  = "Daily"    # 'Daily', 'Monthly', or 'Annual'
+
+# Observation file and column (set to None if no observations are available)
+stf_obd_files = glob.glob(os.path.join(wd, "stf*.obd.csv"))
+OBD_FILE = os.path.basename(stf_obd_files[0]) if stf_obd_files else None
+OBD_COL  = None   # set to the column name in the CSV, e.g. "Q_cms"
+# ────────────────────────────────────────────────────────────────────────────
+
+stf_df = get_streamflow(
+    swatmf_folder=wd,
+    subbasin=SUBBASIN,
+    start_date=start_str,
+    iprint=iprint,
+    timescale=TIMESCALE,
+    obd_file=OBD_FILE,
+    obd_col=OBD_COL,
+)
+
+stf_df.head()
+```
+
+### 2.1  Plot
+
+```{python}
+fig, ax = plot_streamflow(
+    df=stf_df,
+    subbasin=SUBBASIN,
+    obd_col=OBD_COL,
+    timescale=TIMESCALE,
+)
+```
+
+### 2.2  Performance metrics
+
+```{python}
+if OBD_COL is not None and OBD_COL in stf_df.columns:
+    stf_stats = compute_statistics(stf_df, obd_col=OBD_COL)
+    print(f"NSE   : {stf_stats['nse']:.4f}")
+    print(f"R²    : {stf_stats['rsq']:.4f}")
+    print(f"PBias : {stf_stats['pbias']:.4f} %")
+    print(f"RMSE  : {stf_stats['rmse']:.4f} m³/s")
+else:
+    stf_stats = None
+    print("No observed streamflow data loaded; skipping metrics.")
+```
+
+### 2.3  Export
+
+```{python}
+import os; os.makedirs(out, exist_ok=True)
+
+fpath = export_streamflow(
+    df=stf_df,
+    out_folder=out,
+    subbasin=SUBBASIN,
+    obd_col=OBD_COL or "",
+    timescale=TIMESCALE,
+    stats=stf_stats,
+)
+print("Exported to:", fpath)
+```
+
+---
+
+## 3  Groundwater Levels
+
+Simulated hydraulic heads are read from `swatmf_out_MF_obs` using the
+observation cell list in `modflow.obs`.  Observed water-level data should be
+in `dtw*.obd.csv` or `gwl*.obd.csv` files.
+
+```{python}
+import glob
+from swatmf.outputs.groundwater import (
+    read_mf_obs, get_groundwater, compute_statistics as gw_stats,
+    plot_groundwater, export_groundwater
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+GRID_ID        = 1         # MODFLOW grid cell ID (must be in modflow.obs)
+GW_TIMESCALE   = "Daily"
+DEPTH_TO_WATER = False     # True → subtract land-surface elevation
+
+gw_obd_files = (
+    glob.glob(os.path.join(wd, "dtw*.obd.csv")) +
+    glob.glob(os.path.join(wd, "gwl*.obd.csv"))
+)
+GW_OBD_FILE = os.path.basename(gw_obd_files[0]) if gw_obd_files else None
+GW_OBD_COL  = None   # set to the column name in the CSV
+# ────────────────────────────────────────────────────────────────────────────
+
+# Show available observation cells
+mf_obs_meta = read_mf_obs(wd)
+print(f"Observation cells available: {mf_obs_meta.index.tolist()}")
+```
+
+```{python}
+gw_df = get_groundwater(
+    swatmf_folder=wd,
+    grid_id=GRID_ID,
+    start_date=start_str,
+    timescale=GW_TIMESCALE,
+    depth_to_water=DEPTH_TO_WATER,
+    obd_file=GW_OBD_FILE,
+    obd_col=GW_OBD_COL,
+)
+
+gw_df.head()
+```
+
+### 3.1  Plot
+
+```{python}
+fig, ax = plot_groundwater(
+    df=gw_df,
+    grid_id=GRID_ID,
+    obd_col=GW_OBD_COL,
+    timescale=GW_TIMESCALE,
+    depth_to_water=DEPTH_TO_WATER,
+)
+```
+
+### 3.2  Performance metrics
+
+```{python}
+if GW_OBD_COL is not None and GW_OBD_COL in gw_df.columns:
+    gw_metrics = gw_stats(gw_df, grid_id=GRID_ID, obd_col=GW_OBD_COL)
+    print(f"NSE   : {gw_metrics['nse']:.4f}")
+    print(f"R²    : {gw_metrics['rsq']:.4f}")
+    print(f"PBIAS : {gw_metrics['pbias']:.4f} %")
+    print(f"RMSE  : {gw_metrics['rmse']:.4f} m")
+else:
+    gw_metrics = None
+    print("No observed groundwater data loaded; skipping metrics.")
+```
+
+### 3.3  Export
+
+```{python}
+fpath = export_groundwater(
+    df=gw_df,
+    out_folder=out,
+    grid_id=GRID_ID,
+    obd_col=GW_OBD_COL or "",
+    timescale=GW_TIMESCALE,
+    stats=gw_metrics,
+)
+print("Exported to:", fpath)
+```
+
+---
+
+## 4  MODFLOW Recharge
+
+Gridded recharge values (one value per MODFLOW grid cell, per time step) are
+read from `swatmf_out_MF_recharge*`.
+
+> **Note:** The number of grid cells (`N_CELLS`) must be specified because
+> the output file is written without an explicit row count.  You can obtain
+> this from the MODFLOW discretisation file (`.dis`) or from the number of
+> features in the `mf_grid` shapefile.
+
+```{python}
+from swatmf.outputs.recharge import (
+    read_recharge_dates, get_recharge,
+    average_monthly_recharge,
+    plot_recharge_timeseries, plot_avg_monthly_recharge
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+N_CELLS       = 100       # total number of MODFLOW active grid cells
+RCH_TIMESCALE = "Monthly" # 'Daily', 'Monthly', or 'Annual'
+# ────────────────────────────────────────────────────────────────────────────
+
+rch_dates = read_recharge_dates(wd, timescale=RCH_TIMESCALE, start_date=start_mdy)
+print(f"Available {RCH_TIMESCALE.lower()} recharge steps: {len(rch_dates)}")
+print(f"  First: {rch_dates[0]}   Last: {rch_dates[-1]}")
+```
+
+```{python}
+rch_df = get_recharge(
+    swatmf_folder=wd,
+    n_cells=N_CELLS,
+    start_date=start_mdy,
+    timescale=RCH_TIMESCALE,
+)
+
+print(rch_df.shape)  # (n_dates, n_cells)
+rch_df.iloc[:5, :5]
+```
+
+### 4.1  Spatial mean recharge over time
+
+```{python}
+fig, ax = plot_recharge_timeseries(rch_df)
+```
+
+### 4.2  Average monthly recharge
+
+```{python}
+if RCH_TIMESCALE == "Monthly":
+    avg_rch = average_monthly_recharge(rch_df)
+    fig, ax = plot_avg_monthly_recharge(avg_rch)
+```
+
+---
+
+## 5  Groundwater–Surface-Water Exchange
+
+GW-SW exchange fluxes are read from `swatmf_out_MF_gwsw*`.  Positive values
+indicate groundwater discharge to the stream; negative values indicate stream
+losses to the aquifer.
+
+> **Note:** `N_RIV_CELLS` is the number of MODFLOW river cells.  This can be
+> read from the RIV package file or derived from the `river_grid` shapefile.
+
+```{python}
+from swatmf.outputs.gwsw import (
+    read_gwsw_dates, get_gwsw,
+    gwsw_basin_total,
+    plot_gwsw_timeseries, export_gwsw
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+N_RIV_CELLS    = 20       # number of MODFLOW river cells
+GWSW_TIMESCALE = "Daily"  # 'Daily', 'Monthly', or 'Annual'
+# ────────────────────────────────────────────────────────────────────────────
+
+gwsw_dates = read_gwsw_dates(wd, timescale=GWSW_TIMESCALE, start_date=start_mdy)
+print(f"Available {GWSW_TIMESCALE.lower()} GW-SW steps: {len(gwsw_dates)}")
+print(f"  First: {gwsw_dates[0]}   Last: {gwsw_dates[-1]}")
+```
+
+```{python}
+gwsw_df = get_gwsw(
+    swatmf_folder=wd,
+    n_riv_cells=N_RIV_CELLS,
+    start_date=start_mdy,
+    timescale=GWSW_TIMESCALE,
+)
+
+print(gwsw_df.shape)  # (n_dates, n_river_cells)
+gwsw_df.head()
+```
+
+### 5.1  Basin total GW-SW exchange
+
+```{python}
+fig, ax = plot_gwsw_timeseries(gwsw_df, timescale=GWSW_TIMESCALE)
+```
+
+### 5.2  Export
+
+```{python}
+fpath = export_gwsw(gwsw_df, out, timescale=GWSW_TIMESCALE)
+print("Exported to:", fpath)
+```
+
+---
+
+## 6  Water Balance
+
+The SWAT water balance is read from `output.std`.
+
+```{python}
+from swatmf.outputs.water_balance import (
+    get_water_balance, plot_water_balance, export_water_balance
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+WB_TIMESCALE = "Daily"  # 'Daily', 'Monthly', or 'Annual'
+# ────────────────────────────────────────────────────────────────────────────
+
+wb_df = get_water_balance(
+    swatmf_folder=wd,
+    start_date=sp.start_date_warmup,
+    end_year=end_year,
+    iprint=iprint,
+    timescale=WB_TIMESCALE,
+)
+
+wb_df.head()
+```
+
+### 6.1  Four-panel water balance plot
+
+```{python}
+fig, axes = plot_water_balance(wb_df, timescale=WB_TIMESCALE)
+```
+
+### 6.2  Export
+
+```{python}
+fpath = export_water_balance(wb_df, out, timescale=WB_TIMESCALE)
+print("Exported to:", fpath)
+```
+
+---
+
+## 7  Performance Metrics Summary
+
+Aggregate all available metrics into a single summary table.
+
+```{python}
+import pandas as pd
+
+records = []
+
+if stf_stats is not None:
+    records.append({
+        "Variable": f"Streamflow (subbasin {SUBBASIN})",
+        "Timescale": TIMESCALE,
+        "NSE":   round(stf_stats["nse"],   4),
+        "R²":    round(stf_stats["rsq"],   4),
+        "PBIAS": round(stf_stats["pbias"], 4),
+        "RMSE":  round(stf_stats["rmse"],  4),
+    })
+
+if gw_metrics is not None:
+    records.append({
+        "Variable": f"Groundwater Level (grid {GRID_ID})",
+        "Timescale": GW_TIMESCALE,
+        "NSE":   round(gw_metrics["nse"],   4),
+        "R²":    round(gw_metrics["rsq"],   4),
+        "PBIAS": round(gw_metrics["pbias"], 4),
+        "RMSE":  round(gw_metrics["rmse"],  4),
+    })
+
+if records:
+    summary = pd.DataFrame(records).set_index("Variable")
+    display(summary)
+else:
+    print("No observed data was loaded; no statistics to summarise.")
+```
+
+---
+
+## Appendix — Package structure
+
+```
+swatmf/
+├── __init__.py              # exposes Paths, parse_file_cio
+├── paths.py                 # Paths class (replaces dirs_and_paths)
+├── sim_period.py            # parse_file_cio (replaces define_sim_period)
+├── metrics.py               # nse, rmse, pbias, rsq, all_metrics
+└── outputs/
+    ├── __init__.py
+    ├── streamflow.py        # post_i_sw.py → get_streamflow, plot_streamflow
+    ├── groundwater.py       # post_ii_gw.py → get_groundwater, plot_groundwater
+    ├── recharge.py          # post_iii_rch.py → get_recharge, plot_recharge_*
+    ├── gwsw.py              # post_iv_gwsw.py → get_gwsw, plot_gwsw_timeseries
+    └── water_balance.py     # post_v_wb.py → get_water_balance, plot_water_balance
+```
+
+### Correspondence to QSWATMOD2 plugin tabs
+
+| Workflow step | Plugin tab / module | `swatmf` module |
+|---|---|---|
+| Project paths | `QSWATMOD2.dirs_and_paths` | `swatmf.paths.Paths` |
+| Simulation period | `QSWATMOD2.define_sim_period` | `swatmf.sim_period.parse_file_cio` |
+| Streamflow | **Tab 4** / `post_i_sw.py` | `swatmf.outputs.streamflow` |
+| Groundwater levels | **Tab 4** / `post_ii_gw.py` | `swatmf.outputs.groundwater` |
+| MODFLOW recharge | **Tab 4** / `post_iii_rch.py` | `swatmf.outputs.recharge` |
+| GW-SW exchange | **Tab 4** / `post_iv_gwsw.py` | `swatmf.outputs.gwsw` |
+| Water balance | **Tab 4** / `post_v_wb.py` | `swatmf.outputs.water_balance` |
+| Objective functions | `pyfolder/utils.py ObjFns` | `swatmf.metrics` |
