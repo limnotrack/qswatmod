@@ -738,6 +738,8 @@ def create_mf_model(
 
     # RIV package — convert 1-based row/col to 0-based for flopy
     riv_sorted = riv_df.sort_values(
+        # Prefer sorting by grid_id for consistent ordering; fall back to row
+        # if grid_id is absent (e.g. when riv_df comes directly from parse_riv_file).
         riv_df.columns.intersection(["grid_id", "row"]).tolist() or riv_df.columns[:1].tolist()
     )
     riv_array = np.column_stack([

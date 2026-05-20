@@ -199,7 +199,10 @@ riv_df = pd.DataFrame({
     "riv_bot":   [196.0, 195.5, 195.0, 194.5],
 })
 
-# Duration: simulation days + 100 to account for leap years (plugin convention)
+# Duration: add a 100-day buffer beyond the SWAT simulation length so the
+# MODFLOW stress-period table extends past the last SWAT time step.  The
+# plugin's writeMFmodel() uses the same + 100 buffer to avoid an off-by-one
+# when the last year of the simulation is a leap year.
 duration = sim_period + 100
 
 mf = create_mf_model(
