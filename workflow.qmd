@@ -97,8 +97,12 @@ sim_period = (sp.end_date - sp.start_date).days
 The pre-processing steps configure the spatial linkage between SWAT and
 MODFLOW.  The `swatmf` package handles all file-based I/O and spatial
 operations (intersections, area calculations, link table generation) without
-requiring QGIS.  The only step that still requires QGIS is creating the
-initial `mf_grid` shapefile when using Scenario A or B (Section 2.2).
+requiring QGIS.
+
+- **Scenario C** (build from scratch) generates `mf_grid.gpkg` entirely in
+  Python via `create_mf_grid`.
+- **Scenarios A and B** (existing model) may still require QGIS to create the
+  initial `mf_grid` shapefile if one does not already exist.
 
 ### 2.1  SWAT Inputs
 
@@ -185,6 +189,9 @@ DELR      = 100.0                   # cell height [m]
 DELC      = 100.0                   # cell width  [m]
 NROW      = 50                      # number of rows
 NCOL      = 60                      # number of columns
+X_ORIGIN  = 367000.0                # X (easting)  of the NW grid corner [m]
+Y_ORIGIN  = 6234000.0               # Y (northing) of the NW grid corner [m]
+CRS       = "EPSG:32632"            # coordinate reference system (EPSG code or WKT)
 # ────────────────────────────────────────────────────────────────────────────
 
 # Example: uniform arrays — replace with raster-loaded arrays as needed
@@ -227,6 +234,24 @@ mf = create_mf_model(
 )
 
 print(f"MODFLOW model '{MF_NAME}' written to: {MF_FOLDER}")
+```
+
+With the model files written (including the `.dis` file), generate the
+`mf_grid.gpkg` GeoPackage that the linking process requires.  `create_mf_grid`
+reads the grid dimensions from the `.dis` file and builds one polygon per cell,
+annotated with `grid_id`, `row`, `col`, and `top_elev`.
+
+```{python}
+from swatmf.preprocessing.modflow import create_mf_grid
+
+mfgrid_path = create_mf_grid(
+    swatmf_folder = wd,
+    x_origin      = X_ORIGIN,
+    y_origin      = Y_ORIGIN,
+    crs           = CRS,
+    output_dir    = paths.sm_shps,   # → GIS/SMshps/mf_grid.gpkg
+)
+print("mf_grid.gpkg written to:", mfgrid_path)
 ```
 
 After the model is written, validate the MODFLOW inputs and prepare the
