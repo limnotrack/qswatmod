@@ -94,8 +94,10 @@ sim_period = (sp.end_date - sp.start_date).days
 ## 2  Pre-Processing Tab
 
 The pre-processing steps configure the spatial linkage between SWAT and
-MODFLOW.  Geospatial operations (creating grids, intersecting shapefiles)
-still require QGIS; the `swatmf` package handles all file-based I/O.
+MODFLOW.  The `swatmf` package handles all file-based I/O and spatial
+operations (intersections, area calculations, link table generation) without
+requiring QGIS.  The only step that still requires QGIS is creating the
+initial `mf_grid` shapefile when using Scenario A or B (Section 2.2).
 
 ### 2.1  SWAT Inputs
 

@@ -196,24 +196,13 @@ def build_hru_dhru(
             "and subbasin shapefiles share the same CRS and spatial extent."
         )
 
-    # Dissolve by dhru_id to get per-dhru area (area_f)
-    dissolved = (
-        intersected.dissolve(by="dhru_id", aggfunc="first").reset_index()
-    )
-    dissolved["area_f"] = dissolved.geometry.area
-
-    # Keep only Subbasin and area_f from the dissolved layer;
-    # the other attributes are kept from the intersected layer
-    area_lookup = dissolved.set_index("dhru_id")["area_f"]
-    intersected["area_f"] = intersected["dhru_id"].map(area_lookup)
-
-    # Re-dissolve at dhru_id × Subbasin level so each row is unique
+    # Dissolve at dhru_id × Subbasin level so each row is unique, then
+    # compute area_f from the dissolved geometry in a single pass.
     hru_dhru = (
         intersected
         .dissolve(by=["dhru_id", "Subbasin"], aggfunc="first")
         .reset_index()
     )
-    # Recalculate area_f from the dissolved geometry
     hru_dhru["area_f"] = hru_dhru.geometry.area
 
     # Drop slivers
