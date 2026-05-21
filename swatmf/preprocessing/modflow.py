@@ -1233,6 +1233,7 @@ def import_mf_grid(
         gdf["grid_id"] = gdf.index + 1
 
     # 3 — add row / col from .dis if not already present
+    dis = None
     if (row_col is None or row_col not in gdf.columns) and "row" not in gdf.columns:
         dis = parse_dis_file(wd)
         rows_all, cols_all = grid_row_col(dis)
@@ -1247,7 +1248,7 @@ def import_mf_grid(
 
     # 4 — add top_elev from .dis if not already present
     if "top_elev" not in gdf.columns:
-        if not locals().get("dis"):
+        if dis is None:
             dis = parse_dis_file(wd)
         top_elevs = dis.top_elevs
         n = len(gdf)

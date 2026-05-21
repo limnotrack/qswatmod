@@ -1835,7 +1835,7 @@ class QSWATMOD2(object):
     #     for sub in subbasin_list:
     #         subbasin_list_1.extend(sub)
 
-    def createMF(self):
+    def createMF(self, silent=False):
         QSWATMOD_path_dict = self.dirs_and_paths()
         has_dis = any(file.endswith(".dis") for file in os.listdir(QSWATMOD_path_dict['SMfolder']))
         self.dlg.progressBar_sm_link.setValue(0)
@@ -1845,12 +1845,12 @@ class QSWATMOD2(object):
             QCoreApplication.processEvents()
         elif self.dlg.mf_option_1.isChecked() or self.dlg.mf_option_3.isChecked():
             if not self.prepare_existing_mf_grid():
-                return
+                return False
             self.dlg.progressBar_sm_link.setValue(20)
             QCoreApplication.processEvents()
         else:
             self.main_messageBox("Select option", "Please select one MODFLOW option first.")
-            return
+            return False
 
         modflow_functions.create_grid_id(self)
         self.dlg.progressBar_sm_link.setValue(60)
@@ -1876,11 +1876,13 @@ class QSWATMOD2(object):
         # class_mf = createMFmodelDialog(self) # make the class the object
         # class_mf.use_sub_shapefile()
         # time = datetime.now().strftime('[%m/%d/%y %H:%M:%S]')
-        msgBox = QMessageBox()
-        msgBox.setWindowIcon(QtGui.QIcon(':/QSWATMOD2/pics/sm_icon.png'))
-        msgBox.setWindowTitle("Created!")
-        msgBox.setText("'mf_grid.gpkg' was created/prepared!")
-        msgBox.exec_()
+        if not silent:
+            msgBox = QMessageBox()
+            msgBox.setWindowIcon(QtGui.QIcon(':/QSWATMOD2/pics/sm_icon.png'))
+            msgBox.setWindowTitle("Created!")
+            msgBox.setText("'mf_grid.gpkg' was created/prepared!")
+            msgBox.exec_()
+        return True
 
     def prepare_existing_mf_grid(self):
         QSWATMOD_path_dict = self.dirs_and_paths()
@@ -1915,7 +1917,9 @@ class QSWATMOD2(object):
         self.dlg.textEdit_sm_link_log.append('======== Start Linking Process =========')
         if self.mf_option_needs_preparation():
             self.dlg.textEdit_sm_link_log.append("Preparing MODFLOW grid from selected option ...")
-            self.createMF()
+            if not self.createMF(silent=True):
+                self.dlg.textEdit_sm_link_log.append("Grid preparation failed — linking aborted.")
+                return
         
         # Create hru_dhru
         linking_process.hru_dhru(self)
