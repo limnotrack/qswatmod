@@ -15,6 +15,7 @@ paths                        : project directory/path management
 sim_period                   : simulation period parsing (file.cio)
 metrics                      : objective functions (NSE, RMSE, PBias, R²)
 preprocessing.modflow        : parse/write MODFLOW files; build new MF model
+preprocessing.linking        : generate hru_dhru and dhru_grid link tables
 simulation                   : read/write swatmf_link.txt configuration
 outputs/streamflow           : read & visualise output.rch
 outputs/groundwater          : read & visualise swatmf_out_MF_obs

@@ -328,22 +328,94 @@ print(riv_params)
 
 ### 2.5  Linking Process
 
-The linking process (intersection of SWAT HRUs with the MODFLOW grid,
-creation of `hru_dhru`, `dhru_grid`, `river_grid` tables) is a spatial
-operation that must be performed in QGIS using the **Linking Process** panel.
-Once complete, the exported link tables (`hru_dhru`, `dhru_grid`) are stored
-in the `GIS/Table` folder and are read automatically by the SWAT-MODFLOW
-executable at runtime.
+The linking process creates two tab-delimited ASCII tables read by the
+SWAT-MODFLOW executable at runtime:
+
+| File | Description |
+|------|-------------|
+| `hru_dhru` | Maps each disaggregated HRU (dHRU) to its parent HRU and subbasin |
+| `dhru_grid` | Maps each dHRU fragment to the MODFLOW grid cells it overlaps |
+
+Both files are now generated using :mod:`swatmf.preprocessing.linking`, which
+replicates the QGIS **Linking Process** panel using GeoPandas.
+
+**Required input shapefiles** (created in earlier steps):
+
+| File | Contents | Typical location |
+|------|----------|-----------------|
+| `hru_link.gpkg` | SWAT HRU polygons with `HRU_ID`, `hru_area` | `GIS/SMshps/` |
+| `sub_link.gpkg` | SWAT subbasin polygons with `Subbasin` | `GIS/SMshps/` |
+| `mf_grid.gpkg` | MODFLOW grid polygons with `grid_id` | `GIS/SMshps/` |
 
 ```{python}
-# Verify that the link tables produced by QGIS are present
-link_tables = ["hru_dhru", "dhru_grid"]
-table_dir   = paths.table_folder
+import os
+import geopandas as gpd
+from swatmf.preprocessing.linking import generate_link_tables
 
-for tbl in link_tables:
-    path_tbl = os.path.join(table_dir, tbl)
-    status = "✔ found" if os.path.isfile(path_tbl) else "⚠ MISSING"
-    print(f"  {tbl:<15} {status}")
+# ── Input file paths ─────────────────────────────────────────────────────────
+hru_path    = os.path.join(paths.sm_shps, "hru_link.gpkg")
+sub_path    = os.path.join(paths.sm_shps, "sub_link.gpkg")
+mfgrid_path = os.path.join(paths.sm_shps, "mf_grid.gpkg")
+# ────────────────────────────────────────────────────────────────────────────
+
+result = generate_link_tables(
+    hru_path    = hru_path,
+    sub_path    = sub_path,
+    mfgrid_path = mfgrid_path,
+    table_dir   = paths.table_folder,
+    # Optional: save intermediate GeoPackages for QA/QC in QGIS
+    save_intermediate = True,
+    intermediate_dir  = paths.sm_shps,
+)
+
+print("hru_dhru  →", result["hru_dhru"])
+print("dhru_grid →", result["dhru_grid"])
+```
+
+Verify the output files are present:
+
+```{python}
+for name, fpath in result.items():
+    status = "✔ found" if os.path.isfile(fpath) else "⚠ MISSING"
+    print(f"  {name:<15} {status}")
+```
+
+Inspect the first few lines of each file:
+
+```{python}
+for name, fpath in result.items():
+    print(f"\n--- {name} ---")
+    with open(fpath) as fh:
+        for i, line in enumerate(fh):
+            if i >= 6:
+                break
+            print(line, end="")
+```
+
+If you need to run only one part of the pipeline (e.g. to inspect intermediate
+results), the individual functions are also available:
+
+```{python}
+from swatmf.preprocessing.linking import (
+    create_dhru,       # HRU multipart → singlepart dHRUs
+    build_hru_dhru,    # dHRU × subbasin intersection
+    export_hru_dhru,   # write hru_dhru file
+    build_dhru_grid,   # dHRU × MODFLOW grid intersection
+    export_dhru_grid,  # write dhru_grid file
+)
+
+hru_gdf    = gpd.read_file(hru_path)
+sub_gdf    = gpd.read_file(sub_path)
+mfgrid_gdf = gpd.read_file(mfgrid_path)
+
+# Step-by-step pipeline
+dhru         = create_dhru(hru_gdf)
+hru_dhru_gdf = build_hru_dhru(dhru, sub_gdf)
+dhru_grid_gdf = build_dhru_grid(dhru, mfgrid_gdf)
+
+print(f"dHRUs            : {len(dhru)}")
+print(f"hru_dhru records : {len(hru_dhru_gdf)}")
+print(f"dhru_grid records: {len(dhru_grid_gdf)}")
 ```
 
 ---
