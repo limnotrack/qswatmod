@@ -1837,6 +1837,7 @@ class QSWATMOD2(object):
 
     def createMF(self):
         QSWATMOD_path_dict = self.dirs_and_paths()
+        has_dis = any(file.endswith(".dis") for file in os.listdir(QSWATMOD_path_dict['SMfolder']))
         self.dlg.progressBar_sm_link.setValue(0)
         if self.dlg.mf_option_2.isChecked():
             modflow_functions.MF_grid(self)
@@ -1863,8 +1864,11 @@ class QSWATMOD2(object):
         self.dlg.progressBar_sm_link.setValue(80)
         QCoreApplication.processEvents()
 
-        if any(file.endswith(".dis") for file in os.listdir(QSWATMOD_path_dict['SMfolder'])):
+        if has_dis:
             modflow_functions.create_top_elev(self)
+        else:
+            time = datetime.now().strftime('[%m/%d/%y %H:%M:%S]')
+            self.dlg.textEdit_sm_link_log.append(time+' -> ' + "No .dis file found; skipping 'top_elev' creation.")
         self.dlg.progressBar_sm_link.setValue(100)
         QCoreApplication.processEvents()
         ### Use the "use_sub_shapefile" function from CreateMFmodel_dialog --> not working
@@ -1910,6 +1914,7 @@ class QSWATMOD2(object):
         self.dlg.progressBar_sm_link.setValue(0)
         self.dlg.textEdit_sm_link_log.append('======== Start Linking Process =========')
         if self.mf_option_needs_preparation():
+            self.dlg.textEdit_sm_link_log.append("Preparing MODFLOW grid from selected option ...")
             self.createMF()
         
         # Create hru_dhru
