@@ -204,7 +204,7 @@ CRS       = "EPSG:32632"            # output CRS (EPSG code or WKT)
 # (e.g. "GIS/thickness.tif") for spatially varying values.
 THICKNESS = 30.0                    # aquifer thickness [m]
 SY        = 0.2                     # specific yield [-]
-# initial_head defaults to top_elev − 2 m when omitted
+# initial_head defaults to top_elev - 2 m when omitted
 # INIT_HEAD = 195.0                 # or: "GIS/init_head.tif"
 # ────────────────────────────────────────────────────────────────────────────
 

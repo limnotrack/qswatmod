@@ -1310,6 +1310,7 @@ def build_mf_model_from_dem(
     aquifer_thickness: Union[float, str, os.PathLike] = 30.0,
     sy: Union[float, str, os.PathLike] = 0.2,
     initial_head: Union[float, str, os.PathLike, None] = None,
+    head_depth: float = 2.0,
     hk: float = 5.0,
     ss: float = 1e-4,
     vka: float = 0.1,
@@ -1357,7 +1358,11 @@ def build_mf_model_from_dem(
         ``0.2``.
     initial_head : float, path-like, or None, optional
         Initial hydraulic head [same units as DEM].  Scalar or raster path.
-        If ``None`` (default), the head is set to ``top_elev - 2.0`` m.
+        If ``None`` (default), the head is set to ``top_elev - head_depth``
+        for valid (non-nodata) cells; nodata cells remain masked.
+    head_depth : float, optional
+        Depth below the land surface used to compute the default initial head
+        when *initial_head* is ``None``.  Default ``2.0`` [same units as DEM].
     hk : float, optional
         Horizontal hydraulic conductivity [length/time].  Scalar only.
         Default ``5.0``.
@@ -1538,7 +1543,7 @@ def build_mf_model_from_dem(
     sy_arr = _resolve(sy)
 
     if initial_head is None:
-        head_arr: np.ndarray = np.where(valid, top_elev - 2.0, nodata)
+        head_arr: np.ndarray = np.where(valid, top_elev - head_depth, nodata)
     else:
         head_arr = _resolve(initial_head)
 
