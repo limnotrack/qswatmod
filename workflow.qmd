@@ -173,85 +173,107 @@ print("DIS file(s) found:", dis_files)
 
 #### Scenario C — Build a new MODFLOW model from scratch
 
-When no MODFLOW model exists yet, use `create_mf_model` with flopy to
-generate all required input files.  Spatial inputs (elevation arrays, river
-cell attributes) can be loaded from GeoTIFF rasters or other gridded data.
+When no MODFLOW model exists yet, use `build_mf_model_from_dem` to generate
+all required MODFLOW input files **and** `mf_grid.gpkg` in a single call.
+The function:
+
+* Resamples the DEM to the target cell size.
+* Optionally clips the grid to a boundary shapefile (e.g. the SWAT subbasin
+  polygons) — if no boundary is given the full DEM extent is used.
+* Accepts aquifer thickness, specific yield, and initial head as either a
+  constant scalar value or the path to a GeoTIFF raster.
+* Writes all MODFLOW input files to *MF_FOLDER* and `mf_grid.gpkg` to
+  *paths.sm_shps* ready for the linking process.
 
 ```{python}
-import numpy as np
-from swatmf.preprocessing.modflow import create_mf_model
+from swatmf.preprocessing.modflow import build_mf_model_from_dem
 
 # ── User inputs ─────────────────────────────────────────────────────────────
 MF_NAME   = "my_modflow_model"      # base name for MODFLOW files
-MF_FOLDER = wd                      # output directory
-DELR      = 100.0                   # cell height [m]
-DELC      = 100.0                   # cell width  [m]
-NROW      = 50                      # number of rows
-NCOL      = 60                      # number of columns
-X_ORIGIN  = 367000.0                # X (easting)  of the NW grid corner [m]
-Y_ORIGIN  = 6234000.0               # Y (northing) of the NW grid corner [m]
-CRS       = "EPSG:32632"            # coordinate reference system (EPSG code or WKT)
+MF_FOLDER = wd                      # output directory for MODFLOW files
+DEM_PATH  = "GIS/dem.tif"           # DEM raster (GeoTIFF or any rasterio format)
+
+# Boundary: use the SWAT subbasin polygons to clip the grid, or set to None
+# to use the full DEM extent.
+BOUNDARY  = os.path.join(paths.sm_shps, "sub_link.gpkg")
+
+CELL_SIZE = 200.0                   # target cell size [m] — default 200×200 m
+CRS       = "EPSG:32632"            # output CRS (EPSG code or WKT)
+
+# Aquifer parameters — supply a scalar for uniform values, or a raster path
+# (e.g. "GIS/thickness.tif") for spatially varying values.
+THICKNESS = 30.0                    # aquifer thickness [m]
+SY        = 0.2                     # specific yield [-]
+# initial_head defaults to top_elev − 2 m when omitted
+# INIT_HEAD = 195.0                 # or: "GIS/init_head.tif"
 # ────────────────────────────────────────────────────────────────────────────
 
-# Example: uniform arrays — replace with raster-loaded arrays as needed
-top_elev     = np.full((NROW, NCOL), 200.0)   # land surface elevation [m]
-bot_elev     = np.full((NROW, NCOL), 160.0)   # aquifer bottom elevation [m]
-initial_head = np.full((NROW, NCOL), 195.0)   # initial hydraulic head [m]
-
-# Minimal river DataFrame — replace with compute_riv_params() output
-import pandas as pd
-riv_df = pd.DataFrame({
-    "row":       [5, 6, 7, 8],
-    "col":       [30, 30, 30, 30],
-    "riv_stage": [198.0, 197.5, 197.0, 196.5],
-    "riv_cond":  [500.0, 500.0, 500.0, 500.0],
-    "riv_bot":   [196.0, 195.5, 195.0, 194.5],
-})
-
-# Duration: add a 100-day buffer beyond the SWAT simulation length so the
-# MODFLOW stress-period table extends past the last SWAT time step.  The
-# plugin's writeMFmodel() uses the same + 100 buffer to avoid an off-by-one
-# when the last year of the simulation is a leap year.
+# Duration: add a 100-day buffer beyond the SWAT simulation length.
 duration = sim_period + 100
 
-mf = create_mf_model(
-    mf_folder=MF_FOLDER,
-    mf_name=MF_NAME,
-    top_elev=top_elev,
-    bot_elev=bot_elev,
-    delr=DELR,
-    delc=DELC,
-    hk=5.0,           # horizontal hydraulic conductivity [m/day]
-    ss=1e-4,          # specific storage [1/m]
-    sy=0.20,          # specific yield [-]
-    initial_head=initial_head,
-    riv_df=riv_df,
-    sim_duration=duration,
-    vka=0.1,
-    laytype=1,        # 1 = convertible layer
-    # evt=0.001,      # optional: evapotranspiration rate [m/day]
+result = build_mf_model_from_dem(
+    dem_path          = DEM_PATH,
+    mf_folder         = MF_FOLDER,
+    mf_name           = MF_NAME,
+    boundary_path     = BOUNDARY,
+    cell_size         = CELL_SIZE,
+    aquifer_thickness = THICKNESS,
+    sy                = SY,
+    # initial_head    = INIT_HEAD,  # uncomment to override the default
+    hk                = 5.0,        # hydraulic conductivity [m/day]
+    ss                = 1e-4,       # specific storage [1/m]
+    crs               = CRS,
+    output_dir        = paths.sm_shps,  # → GIS/SMshps/mf_grid.gpkg
+    sim_duration      = duration,
 )
 
 print(f"MODFLOW model '{MF_NAME}' written to: {MF_FOLDER}")
+print(f"Grid            : {result.nrow} rows × {result.ncol} cols")
+print(f"Origin (NW)     : ({result.x_origin:.1f}, {result.y_origin:.1f})")
+print(f"mf_grid.gpkg    : {result.grid_path}")
 ```
 
-With the model files written (including the `.dis` file), generate the
-`mf_grid.gpkg` GeoPackage that the linking process requires.  `create_mf_grid`
-reads the grid dimensions from the `.dis` file and builds one polygon per cell,
-annotated with `grid_id`, `row`, `col`, and `top_elev`.
+If you need to add river cells after the initial build, use
+`compute_riv_params` / `write_riv_file` (see Section 2.4) and pass the
+resulting DataFrame as `riv_df` to `build_mf_model_from_dem`.
+
+> **Manual alternative** — if you already have numpy elevation arrays (e.g.
+> loaded from your own raster pipeline), you can call `create_mf_model` and
+> `create_mf_grid` individually as shown in the collapsible block below.
+
+<details>
+<summary>Manual array approach (click to expand)</summary>
 
 ```{python}
-from swatmf.preprocessing.modflow import create_mf_grid
+import numpy as np
+import pandas as pd
+from swatmf.preprocessing.modflow import create_mf_model, create_mf_grid
+
+NROW, NCOL = 50, 60
+DELR = DELC = 200.0
+X_ORIGIN, Y_ORIGIN = 367000.0, 6234000.0
+
+top_elev = np.full((NROW, NCOL), 200.0)
+bot_elev = np.full((NROW, NCOL), 170.0)
+
+mf = create_mf_model(
+    mf_folder=wd, mf_name=MF_NAME,
+    top_elev=top_elev, bot_elev=bot_elev,
+    delr=DELR, delc=DELC,
+    hk=5.0, ss=1e-4, sy=0.2,
+    initial_head=top_elev - 2.0,
+    riv_df=None,
+    sim_duration=duration,
+)
 
 mfgrid_path = create_mf_grid(
-    swatmf_folder = wd,
-    x_origin      = X_ORIGIN,
-    y_origin      = Y_ORIGIN,
-    crs           = CRS,
-    output_dir    = paths.sm_shps,   # → GIS/SMshps/mf_grid.gpkg
+    swatmf_folder=wd, x_origin=X_ORIGIN, y_origin=Y_ORIGIN,
+    crs=CRS, output_dir=paths.sm_shps,
 )
 print("mf_grid.gpkg written to:", mfgrid_path)
 ```
+
+</details>
 
 After the model is written, validate the MODFLOW inputs and prepare the
 required helper files with a single call:
@@ -259,10 +281,10 @@ required helper files with a single call:
 ```{python}
 from swatmf.preprocessing.modflow import check_modflow_files
 
-result = check_modflow_files(wd)
-for msg in result["messages"]:
+check_result = check_modflow_files(wd)
+for msg in check_result["messages"]:
     print(msg)
-print("Status:", result["status"])
+print("Status:", check_result["status"])
 ```
 
 `check_modflow_files` replicates the **Check MODFLOW file** button in the

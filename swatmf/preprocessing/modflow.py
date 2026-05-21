@@ -26,6 +26,10 @@ create_mf_grid         — Build the ``mf_grid.gpkg`` polygon grid from a .dis f
                          and NW-corner coordinates (MODFLOW Option 2 / Scenario B).
 import_mf_grid         — Import an existing grid shapefile/GeoPackage and annotate it
                          with grid_id, row, col, top_elev (MODFLOW Option 1 / Scenario A).
+build_mf_model_from_dem — Build a complete MODFLOW model from a DEM raster (Scenario C):
+                          resamples the DEM to a regular grid, derives bot_elev / sy /
+                          initial_head from scalars or rasters, calls create_mf_model,
+                          and writes mf_grid.gpkg in one step.
 """
 
 from __future__ import annotations
@@ -98,6 +102,34 @@ class RivCell(NamedTuple):
     stage: float
     cond: float
     rbot: float
+
+
+class MFModelResult(NamedTuple):
+    """Result returned by :func:`build_mf_model_from_dem`.
+
+    Attributes
+    ----------
+    mf : flopy.modflow.Modflow
+        The constructed (and written) flopy model object.
+    grid_path : str
+        Absolute path to the written ``mf_grid.gpkg`` GeoPackage.
+    x_origin : float
+        X coordinate (easting) of the north-west corner of the grid used when
+        building the polygon grid.
+    y_origin : float
+        Y coordinate (northing) of the north-west corner of the grid.
+    nrow : int
+        Number of rows in the MODFLOW grid.
+    ncol : int
+        Number of columns in the MODFLOW grid.
+    """
+
+    mf: object          # flopy.modflow.Modflow — avoid circular import annotation
+    grid_path: str
+    x_origin: float
+    y_origin: float
+    nrow: int
+    ncol: int
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +627,7 @@ def create_mf_model(
     ss: Union[float, np.ndarray],
     sy: Union[float, np.ndarray],
     initial_head: Union[float, np.ndarray],
-    riv_df: pd.DataFrame,
+    riv_df: Optional[pd.DataFrame],
     sim_duration: int,
     *,
     vka: float = 0.1,
@@ -639,11 +671,12 @@ def create_mf_model(
         Specific yield [dimensionless].
     initial_head : float or np.ndarray
         Initial hydraulic head [length units].
-    riv_df : pd.DataFrame
+    riv_df : pd.DataFrame or None
         River-package cell data.  Must contain columns ``layer``, ``row``,
         ``col``, ``riv_stage``, ``riv_cond``, ``riv_bot``.  Use
         :func:`compute_riv_params` to derive these from ``river_grid``
-        attributes.
+        attributes.  Pass ``None`` to omit the RIV package entirely (useful
+        when building a draft model before river cells are defined).
     sim_duration : int
         Total simulation duration [days].  Adding ~100 days is recommended
         to account for leap years (matches the plugin convention).
@@ -742,20 +775,21 @@ def create_mf_model(
         fm.ModflowEvt(mf, nevtop=3, evtr=evt)
 
     # RIV package — convert 1-based row/col to 0-based for flopy
-    riv_sorted = riv_df.sort_values(
-        # Prefer sorting by grid_id for consistent ordering; fall back to row
-        # if grid_id is absent (e.g. when riv_df comes directly from parse_riv_file).
-        riv_df.columns.intersection(["grid_id", "row"]).tolist() or riv_df.columns[:1].tolist()
-    )
-    riv_array = np.column_stack([
-        riv_sorted.get("layer", pd.Series(np.ones(len(riv_sorted), dtype=int))).values - 1,
-        riv_sorted["row"].values - 1,
-        riv_sorted["col"].values - 1,
-        riv_sorted["riv_stage"].values.astype(float),
-        riv_sorted["riv_cond"].values.astype(float),
-        riv_sorted["riv_bot"].values.astype(float),
-    ])
-    fm.ModflowRiv(mf, stress_period_data={0: riv_array})
+    if riv_df is not None and len(riv_df) > 0:
+        riv_sorted = riv_df.sort_values(
+            # Prefer sorting by grid_id for consistent ordering; fall back to row
+            # if grid_id is absent (e.g. when riv_df comes directly from parse_riv_file).
+            riv_df.columns.intersection(["grid_id", "row"]).tolist() or riv_df.columns[:1].tolist()
+        )
+        riv_array = np.column_stack([
+            riv_sorted.get("layer", pd.Series(np.ones(len(riv_sorted), dtype=int))).values - 1,
+            riv_sorted["row"].values - 1,
+            riv_sorted["col"].values - 1,
+            riv_sorted["riv_stage"].values.astype(float),
+            riv_sorted["riv_cond"].values.astype(float),
+            riv_sorted["riv_bot"].values.astype(float),
+        ])
+        fm.ModflowRiv(mf, stress_period_data={0: riv_array})
 
     # RCH package — background recharge (SWAT overrides at run time)
     fm.ModflowRch(mf, rech=rch)
@@ -1260,3 +1294,300 @@ def import_mf_grid(
     out_path = os.path.normpath(os.path.join(out_dir, output_filename))
     gdf.to_file(out_path, driver="GPKG")
     return out_path
+
+
+# ---------------------------------------------------------------------------
+# Build a complete MODFLOW model from a DEM raster (Scenario C)
+# ---------------------------------------------------------------------------
+
+def build_mf_model_from_dem(
+    dem_path: str | os.PathLike,
+    mf_folder: str | os.PathLike,
+    mf_name: str,
+    *,
+    boundary_path: str | os.PathLike | None = None,
+    cell_size: float = 200.0,
+    aquifer_thickness: Union[float, str, os.PathLike] = 30.0,
+    sy: Union[float, str, os.PathLike] = 0.2,
+    initial_head: Union[float, str, os.PathLike, None] = None,
+    hk: float = 5.0,
+    ss: float = 1e-4,
+    vka: float = 0.1,
+    crs: str | int | None = None,
+    output_dir: str | os.PathLike | None = None,
+    nodata: float = -9999.0,
+    sim_duration: int = 365,
+    riv_df: Optional[pd.DataFrame] = None,
+) -> MFModelResult:
+    """Build a complete MODFLOW model from a DEM raster.
+
+    This is the high-level entry point for **Scenario C — Build a new MODFLOW
+    model from scratch**.  It combines DEM resampling, parameter array
+    construction, :func:`create_mf_model`, and :func:`create_mf_grid` into a
+    single call.
+
+    The DEM is resampled to *cell_size* × *cell_size* cells.  Aquifer
+    thickness, specific yield, and initial hydraulic head can each be supplied
+    as either a constant scalar or the path to a GeoTIFF raster.  All rasters
+    are reprojected and resampled to match the output grid automatically.
+
+    Parameters
+    ----------
+    dem_path : str or path-like
+        Path to the land-surface DEM raster (any format supported by
+        :mod:`rasterio`, e.g. GeoTIFF).
+    mf_folder : str or path-like
+        Directory where MODFLOW input files will be written (the SWAT-MODFLOW
+        working directory).
+    mf_name : str
+        Base name for the MODFLOW model files.
+    boundary_path : str, path-like, or None, optional
+        Path to a polygon shapefile or GeoPackage used to clip the DEM before
+        building the grid.  If ``None`` the full DEM extent is used.  A
+        subbasin polygon file (e.g. ``sub_link.gpkg``) is a natural choice.
+    cell_size : float, optional
+        Target cell size in the units of the output CRS (metres for a
+        projected CRS).  Default ``200.0``.
+    aquifer_thickness : float or path-like, optional
+        Vertical thickness of the aquifer layer [same units as DEM].  Supply
+        a scalar to use a uniform value, or a raster path for spatially
+        variable thickness.  Default ``30.0``.
+    sy : float or path-like, optional
+        Specific yield [dimensionless].  Scalar or raster path.  Default
+        ``0.2``.
+    initial_head : float, path-like, or None, optional
+        Initial hydraulic head [same units as DEM].  Scalar or raster path.
+        If ``None`` (default), the head is set to ``top_elev - 2.0`` m.
+    hk : float, optional
+        Horizontal hydraulic conductivity [length/time].  Scalar only.
+        Default ``5.0``.
+    ss : float, optional
+        Specific storage [1/length].  Scalar only.  Default ``1e-4``.
+    vka : float, optional
+        Vertical anisotropy ratio (VKA in the UPW package).  Default ``0.1``.
+    crs : str, int, or None, optional
+        Coordinate reference system for the output grid — any value accepted
+        by :func:`rasterio.crs.CRS.from_user_input` (e.g. ``"EPSG:27700"`` or
+        an integer EPSG code).  If ``None``, the DEM's own CRS is used.
+    output_dir : str or path-like, optional
+        Directory where ``mf_grid.gpkg`` is written.  Defaults to
+        *mf_folder*.
+    nodata : float, optional
+        Sentinel value for cells outside the model domain.  Default
+        ``-9999.0``.
+    sim_duration : int, optional
+        Simulation duration [days].  A buffer of ~100 days beyond the SWAT
+        run length is recommended.  Default ``365``.
+    riv_df : pd.DataFrame or None, optional
+        River-package cell table (columns: ``row``, ``col``, ``riv_stage``,
+        ``riv_cond``, ``riv_bot``).  Pass ``None`` (default) to omit the RIV
+        package; add it later via :func:`write_riv_file`.
+
+    Returns
+    -------
+    MFModelResult
+        A named-tuple with fields:
+
+        * ``mf``         — the flopy model object (input files already written)
+        * ``grid_path``  — absolute path to the written ``mf_grid.gpkg``
+        * ``x_origin``   — X (easting) of the NW grid corner
+        * ``y_origin``   — Y (northing) of the NW grid corner
+        * ``nrow``       — number of grid rows
+        * ``ncol``       — number of grid columns
+
+    Raises
+    ------
+    ImportError
+        If :mod:`rasterio` or :mod:`geopandas` are not installed.
+    FileNotFoundError
+        If *dem_path* (or *boundary_path*) does not exist.
+
+    Examples
+    --------
+    >>> from swatmf.preprocessing.modflow import build_mf_model_from_dem
+    >>> result = build_mf_model_from_dem(
+    ...     dem_path    = "GIS/dem.tif",
+    ...     mf_folder   = wd,
+    ...     mf_name     = "mymodel",
+    ...     boundary_path = paths.sm_shps + "/sub_link.gpkg",
+    ...     cell_size   = 200.0,
+    ...     aquifer_thickness = 30.0,
+    ...     sy          = 0.2,
+    ...     crs         = "EPSG:32632",
+    ...     output_dir  = paths.sm_shps,
+    ...     sim_duration = sim_period + 100,
+    ... )
+    >>> print("mf_grid written to:", result.grid_path)
+    >>> print(f"Grid: {result.nrow} rows × {result.ncol} cols")
+    """
+    # ── Lazy imports ────────────────────────────────────────────────────────
+    try:
+        import rasterio
+        import rasterio.crs as rasterio_crs
+        from rasterio.transform import from_origin, array_bounds
+        from rasterio.warp import reproject, Resampling, transform_bounds
+    except ImportError as exc:
+        raise ImportError(
+            "rasterio is required for build_mf_model_from_dem.  "
+            "Install with: pip install rasterio"
+        ) from exc
+
+    try:
+        import geopandas as gpd
+    except ImportError as exc:
+        raise ImportError(
+            "geopandas is required for build_mf_model_from_dem.  "
+            "Install with: pip install geopandas"
+        ) from exc
+
+    dem_str = str(dem_path)
+    if not os.path.isfile(dem_str):
+        raise FileNotFoundError(f"DEM raster not found: {dem_str!r}")
+
+    wd = str(mf_folder)
+    os.makedirs(wd, exist_ok=True)
+
+    # ── Open DEM, optionally clip to boundary ────────────────────────────────
+    with rasterio.open(dem_str) as src:
+        src_crs = src.crs
+        src_nodata = src.nodata if src.nodata is not None else nodata
+
+        if boundary_path is not None:
+            from rasterio.mask import mask as rasterio_mask
+            bnd_path = str(boundary_path)
+            if not os.path.isfile(bnd_path):
+                raise FileNotFoundError(
+                    f"Boundary file not found: {bnd_path!r}"
+                )
+            bnd_gdf = gpd.read_file(bnd_path)
+            if bnd_gdf.crs is not None and bnd_gdf.crs != src_crs:
+                bnd_gdf = bnd_gdf.to_crs(src_crs)
+            geoms = bnd_gdf.geometry.tolist()
+            raw_arr, raw_transform = rasterio_mask(
+                src, geoms, crop=True, nodata=src_nodata, filled=True
+            )
+            raw_dem = raw_arr[0].astype(np.float64)
+            raw_h, raw_w = raw_dem.shape
+            raw_bounds = array_bounds(raw_h, raw_w, raw_transform)
+        else:
+            raw_dem = src.read(1).astype(np.float64)
+            raw_transform = src.transform
+            raw_h, raw_w = src.height, src.width
+            raw_bounds = array_bounds(raw_h, raw_w, raw_transform)
+
+    # ── Determine output CRS and bounds ─────────────────────────────────────
+    if crs is not None:
+        dst_crs = rasterio_crs.CRS.from_user_input(crs)
+    else:
+        dst_crs = src_crs
+
+    left, bottom, right, top_b = (
+        transform_bounds(src_crs, dst_crs, *raw_bounds)
+        if dst_crs != src_crs
+        else raw_bounds
+    )
+
+    # ── Compute output grid dimensions and transform ─────────────────────────
+    ncol = max(1, int(np.ceil((right - left) / cell_size)))
+    nrow = max(1, int(np.ceil((top_b - bottom) / cell_size)))
+    x_origin = left
+    y_origin = top_b
+    dst_transform = from_origin(x_origin, y_origin, cell_size, cell_size)
+
+    # ── Resample DEM to target grid ──────────────────────────────────────────
+    top_elev = np.full((nrow, ncol), nodata, dtype=np.float64)
+    reproject(
+        source=raw_dem,
+        destination=top_elev,
+        src_transform=raw_transform,
+        src_crs=src_crs,
+        dst_transform=dst_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.bilinear,
+        src_nodata=src_nodata,
+        dst_nodata=nodata,
+    )
+
+    shape = (nrow, ncol)
+
+    # ── Helper: resolve scalar or raster-path to a (nrow, ncol) array ────────
+    def _resolve(val: Union[float, str, os.PathLike]) -> np.ndarray:
+        if isinstance(val, (int, float)):
+            return np.full(shape, float(val), dtype=np.float64)
+        arr = np.full(shape, nodata, dtype=np.float64)
+        with rasterio.open(str(val)) as rsrc:
+            reproject(
+                source=rasterio.band(rsrc, 1),
+                destination=arr,
+                src_transform=rsrc.transform,
+                src_crs=rsrc.crs,
+                dst_transform=dst_transform,
+                dst_crs=dst_crs,
+                resampling=Resampling.bilinear,
+                src_nodata=rsrc.nodata,
+                dst_nodata=nodata,
+            )
+        return arr
+
+    # ── Derive parameter arrays ──────────────────────────────────────────────
+    valid = top_elev != nodata
+
+    thickness_arr = _resolve(aquifer_thickness)
+    bot_elev = np.where(valid, top_elev - thickness_arr, nodata)
+
+    sy_arr = _resolve(sy)
+
+    if initial_head is None:
+        head_arr: np.ndarray = np.where(valid, top_elev - 2.0, nodata)
+    else:
+        head_arr = _resolve(initial_head)
+
+    ibound = np.where(valid, 1, 0).astype(np.int32)
+
+    # ── Build MODFLOW model ──────────────────────────────────────────────────
+    mf = create_mf_model(
+        mf_folder=wd,
+        mf_name=mf_name,
+        top_elev=top_elev,
+        bot_elev=bot_elev,
+        delr=cell_size,
+        delc=cell_size,
+        hk=hk,
+        ss=ss,
+        sy=sy_arr,
+        initial_head=head_arr,
+        riv_df=riv_df,
+        sim_duration=sim_duration,
+        vka=vka,
+        ibound=ibound,
+        nodata=nodata,
+    )
+
+    # ── Build mf_grid.gpkg ───────────────────────────────────────────────────
+    # Resolve crs to a value accepted by create_mf_grid (str or int)
+    if crs is not None:
+        grid_crs: str | int | None = crs
+    else:
+        epsg = dst_crs.to_epsg() if dst_crs is not None else None
+        grid_crs = epsg if epsg is not None else (
+            dst_crs.to_wkt() if dst_crs is not None else None
+        )
+
+    out_dir = str(output_dir) if output_dir is not None else wd
+    grid_path = create_mf_grid(
+        swatmf_folder=wd,
+        x_origin=x_origin,
+        y_origin=y_origin,
+        crs=grid_crs,
+        output_dir=out_dir,
+    )
+
+    return MFModelResult(
+        mf=mf,
+        grid_path=grid_path,
+        x_origin=x_origin,
+        y_origin=y_origin,
+        nrow=nrow,
+        ncol=ncol,
+    )
+
