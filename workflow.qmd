@@ -53,11 +53,12 @@ from swatmf import Paths, parse_file_cio
 
 # ── Edit these two variables to point at your project ──────────────────────
 PROJECT_DIR  = "/path/to/your/qgis/project/folder"
-PROJECT_NAME = "your_project_name"
+PROJECT_NAME = "test"
 # ───────────────────────────────────────────────────────────────────────────
 
 paths = Paths(PROJECT_DIR, PROJECT_NAME)
 wd    = paths.swatmf_folder          # SWAT-MODFLOW working directory
+wd = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model/TxtInOut"
 out   = paths.exported_files         # where output files are written
 
 print("SWAT-MODFLOW folder :", wd)
