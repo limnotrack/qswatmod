@@ -229,10 +229,28 @@ mf = create_mf_model(
 print(f"MODFLOW model '{MF_NAME}' written to: {MF_FOLDER}")
 ```
 
-After the model is written, generate the `modflow.mfn` name file and update
-the output-control unit numbers:
+After the model is written, validate the MODFLOW inputs and prepare the
+required helper files with a single call:
 
 ```{python}
+from swatmf.preprocessing.modflow import check_modflow_files
+
+result = check_modflow_files(wd)
+for msg in result["messages"]:
+    print(msg)
+print("Status:", result["status"])
+```
+
+`check_modflow_files` replicates the **Check MODFLOW file** button in the
+QSWATMOD2 plugin.  It validates that the required `.dis`, `.nam`, and `.oc`
+files exist, generates `modflow.mfn` (adjusting MODFLOW unit numbers so they
+do not conflict with SWAT-MODFLOW's internal file handles), and updates the
+`HEAD SAVE UNIT` values in the `.oc` output-control file.
+
+If you need to call the individual steps:
+
+```{python}
+# Run the two sub-steps individually if preferred
 from swatmf.preprocessing.modflow import create_modflow_mfn, modify_modflow_oc
 
 mfn_path = create_modflow_mfn(wd)
@@ -331,15 +349,16 @@ print(riv_params)
 
 ### 2.5  Linking Process
 
-The linking process creates two tab-delimited ASCII tables read by the
+The linking process creates three tab-delimited ASCII tables read by the
 SWAT-MODFLOW executable at runtime:
 
 | File | Description |
 |------|-------------|
 | `hru_dhru` | Maps each disaggregated HRU (dHRU) to its parent HRU and subbasin |
-| `dhru_grid` | Maps each dHRU fragment to the MODFLOW grid cells it overlaps |
+| `dhru_grid` | Maps each dHRU fragment to the MODFLOW grid cells it overlaps (sorted by grid × dHRU) |
+| `grid_dhru` | Inverse mapping: sorted by dHRU × grid; header contains `nrow` and `ncol` |
 
-Both files are now generated using :mod:`swatmf.preprocessing.linking`, which
+All three files are generated using :mod:`swatmf.preprocessing.linking`, which
 replicates the QGIS **Linking Process** panel using GeoPandas.
 
 **Required input shapefiles** (created in earlier steps):
@@ -359,31 +378,22 @@ from swatmf.preprocessing.linking import generate_link_tables
 hru_path    = os.path.join(paths.sm_shps, "hru_link.gpkg")
 sub_path    = os.path.join(paths.sm_shps, "sub_link.gpkg")
 mfgrid_path = os.path.join(paths.sm_shps, "mf_grid.gpkg")
-hru_path = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model shapefiles/hru1.shp"
-sub_path = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model shapefiles/subs1.shp"
-mfgrid_path = "C:/Users/data/Downloads/swat-modflow3(1)/Files/2 MODFLOW LRW/MODFLOW model shapefiles/MODFLOW_Grid.shp"
 # ────────────────────────────────────────────────────────────────────────────
 
 result = generate_link_tables(
-    hru_path    = hru_path,
-    sub_path    = sub_path,
-    mfgrid_path = mfgrid_path,
-    table_dir   = paths.table_folder,
+    hru_path       = hru_path,
+    sub_path       = sub_path,
+    mfgrid_path    = mfgrid_path,
+    table_dir      = paths.table_folder,
+    swatmf_folder  = wd,              # reads .dis to embed nrow/ncol in grid_dhru
     # Optional: save intermediate GeoPackages for QA/QC in QGIS
     save_intermediate = True,
     intermediate_dir  = paths.sm_shps,
 )
 
-print("hru_dhru  →", result["hru_dhru"])
-print("dhru_grid →", result["dhru_grid"])
-```
-
-Verify the output files are present:
-
-```{python}
 for name, fpath in result.items():
     status = "✔ found" if os.path.isfile(fpath) else "⚠ MISSING"
-    print(f"  {name:<15} {status}")
+    print(f"  {name:<15} {status}  →  {fpath}")
 ```
 
 Inspect the first few lines of each file:
@@ -408,6 +418,7 @@ from swatmf.preprocessing.linking import (
     export_hru_dhru,   # write hru_dhru file
     build_dhru_grid,   # dHRU × MODFLOW grid intersection
     export_dhru_grid,  # write dhru_grid file
+    export_grid_dhru,  # write grid_dhru file (inverse sort, nrow/ncol header)
 )
 
 hru_gdf    = gpd.read_file(hru_path)
@@ -415,14 +426,43 @@ sub_gdf    = gpd.read_file(sub_path)
 mfgrid_gdf = gpd.read_file(mfgrid_path)
 
 # Step-by-step pipeline
-dhru         = create_dhru(hru_gdf)
-hru_dhru_gdf = build_hru_dhru(dhru, sub_gdf)
+dhru          = create_dhru(hru_gdf)
+hru_dhru_gdf  = build_hru_dhru(dhru, sub_gdf)
 dhru_grid_gdf = build_dhru_grid(dhru, mfgrid_gdf)
 
-print(f"dHRUs            : {len(dhru)}")
-print(f"hru_dhru records : {len(hru_dhru_gdf)}")
-print(f"dhru_grid records: {len(dhru_grid_gdf)}")
+print(f"dHRUs             : {len(dhru)}")
+print(f"hru_dhru records  : {len(hru_dhru_gdf)}")
+print(f"dhru_grid records : {len(dhru_grid_gdf)}")
 ```
+
+### 2.6  Create Linkage Files
+
+The link tables in `GIS/Table` must be copied to the SWAT-MODFLOW working
+directory before the executable can read them.  This replicates the **Create
+linkage files** button (``createLinkFiles``) from the QSWATMOD2 plugin.
+
+```{python}
+from swatmf.simulation import copy_link_files
+
+copied = copy_link_files(
+    table_dir     = paths.table_folder,   # source: GIS/Table/
+    swatmf_folder = wd,                   # destination: SWAT-MODFLOW/
+)
+
+print(f"Copied {len(copied)} file(s):")
+for f in copied:
+    print(f"  {os.path.basename(f)}")
+```
+
+The following files are copied when present:
+
+| File | Role |
+|------|------|
+| `hru_dhru` | dHRU → HRU / subbasin mapping |
+| `dhru_grid` | dHRU → MODFLOW grid mapping (sorted by grid × dHRU) |
+| `grid_dhru` | dHRU → MODFLOW grid mapping (sorted by dHRU × grid) |
+| `river_grid` | MODFLOW river-cell routing table |
+| `*.txt` | Any text files (e.g. configuration overrides) |
 
 ---
 
@@ -510,6 +550,45 @@ from swatmf.simulation import read_swatmf_link
 
 cfg_check = read_swatmf_link(wd)
 print(summarise_link_config(cfg_check))
+```
+
+### 3.5  Run Simulation
+
+Once `swatmf_link.txt` and all link tables are in the working directory,
+launch the SWAT-MODFLOW executable.  The function searches the working
+directory for a recognised executable name and starts it with `cwd` set to
+the working directory so all relative file paths resolve correctly.
+
+```{python}
+from swatmf.simulation import run_simulation
+
+# Run synchronously — blocks until the simulation finishes
+proc = run_simulation(
+    swatmf_folder = wd,
+    # exe_name = "SWAT-MODFLOW3.exe",  # optional: override auto-detection
+    wait = True,                        # False → returns immediately (background)
+)
+print("Simulation finished.  Return code:", proc.returncode)
+```
+
+To run in the background (non-blocking):
+
+```{python}
+# proc = run_simulation(wd, wait=False)
+# while proc.poll() is None:
+#     time.sleep(5)
+#     print("Simulation still running …")
+# print("Done — return code:", proc.returncode)
+```
+
+Verify that the expected output files are present after the run:
+
+```{python}
+output_files = ["swatmf_link.txt", "output.rch", "swatmf_out_MF_obs"]
+for f in output_files:
+    path = os.path.join(wd, f)
+    status = "✔ found" if os.path.isfile(path) else "⚠ MISSING"
+    print(f"  {f:<30} {status}")
 ```
 
 ---

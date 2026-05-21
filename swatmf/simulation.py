@@ -2,10 +2,11 @@
 swatmf.simulation
 ==================
 Read and write the ``swatmf_link.txt`` configuration file that controls
-all SWAT-MODFLOW run-time options.
+all SWAT-MODFLOW run-time options; copy link tables to the working
+directory; and launch the SWAT-MODFLOW executable.
 
-This mirrors the ``create_swatmf_link`` function in
-``pyfolder/runSim_link.py`` / ``runSim_link_ii.py`` without any dependency
+This mirrors the ``create_swatmf_link``, ``copylinkagefiles``, and
+``run_SM`` functions from the QSWATMOD2 plugin without any dependency
 on QGIS, PyQt, or the plugin GUI.
 
 Typical usage
@@ -29,12 +30,24 @@ Typical usage
 4. Or read back an existing file::
 
     cfg = read_swatmf_link(wd)
+
+5. Copy link tables from ``GIS/Table/`` to the working directory::
+
+    copy_link_files(table_dir, wd)
+
+6. Launch the SWAT-MODFLOW executable::
+
+    proc = run_simulation(wd)
+    proc.wait()
 """
 
 from __future__ import annotations
 
+import glob
 import math
 import os
+import shutil
+import subprocess
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
@@ -368,3 +381,179 @@ def summarise_link_config(cfg: SwatmfLinkConfig) -> str:
         f"    Single-value delay [days]  : {cfg.gw_delay}",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Copy link tables from GIS/Table → SWAT-MODFLOW folder
+# ---------------------------------------------------------------------------
+
+#: Link table file names written by :func:`generate_link_tables
+#: <swatmf.preprocessing.linking.generate_link_tables>`.
+_LINK_TABLE_NAMES = ("hru_dhru", "dhru_grid", "grid_dhru", "river_grid")
+
+
+def copy_link_files(
+    table_dir: str | os.PathLike,
+    swatmf_folder: str | os.PathLike,
+    *,
+    extra_extensions: tuple[str, ...] = (".txt",),
+) -> list[str]:
+    """Copy SWAT-MODFLOW link tables from ``GIS/Table`` to the working directory.
+
+    Replicates the **Create linkage files** button (``pushButton_create_linkfiles
+    → createLinkFiles → copylinkagefiles``) from the QSWATMOD2 plugin.
+
+    The following files are copied when present:
+
+    * ``hru_dhru``, ``dhru_grid``, ``grid_dhru``, ``river_grid``
+      (no extension — the primary link tables).
+    * Any ``*.txt`` files in *table_dir* (mirrors the plugin behaviour of
+      calling ``copylinkagefiles``, which copies ``*.txt`` files).
+
+    Parameters
+    ----------
+    table_dir : str or path-like
+        Source directory containing the link tables
+        (``GIS/Table`` in the QSWATMOD2 project layout).
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory (files are copied here).
+    extra_extensions : tuple of str, optional
+        Additional file extensions to copy from *table_dir*.
+        Default ``(".txt",)``.
+
+    Returns
+    -------
+    list of str
+        Absolute paths of the files that were actually copied.
+
+    Examples
+    --------
+    >>> from swatmf import Paths
+    >>> from swatmf.simulation import copy_link_files
+    >>>
+    >>> paths = Paths("/data/my_project", "my_project")
+    >>> copied = copy_link_files(paths.table_folder, paths.swatmf_folder)
+    >>> for f in copied:
+    ...     print("Copied:", f)
+    """
+    src = str(table_dir)
+    dst = str(swatmf_folder)
+    os.makedirs(dst, exist_ok=True)
+
+    copied: list[str] = []
+
+    # 1 — copy the primary link tables (no extension)
+    for name in _LINK_TABLE_NAMES:
+        src_path = os.path.join(src, name)
+        if os.path.isfile(src_path):
+            dst_path = shutil.copy2(src_path, os.path.join(dst, name))
+            copied.append(dst_path)
+
+    # 2 — copy extra-extension files (default: *.txt)
+    for ext in extra_extensions:
+        for src_path in glob.glob(os.path.join(src, f"*{ext}")):
+            fname = os.path.basename(src_path)
+            dst_path = shutil.copy2(src_path, os.path.join(dst, fname))
+            copied.append(dst_path)
+
+    return copied
+
+
+# ---------------------------------------------------------------------------
+# Run SWAT-MODFLOW simulation
+# ---------------------------------------------------------------------------
+
+#: Recognised executable names, in order of preference.
+_EXE_CANDIDATES = (
+    "SWAT-MODFLOW3.exe",
+    "swatmf_rel230818.exe",
+    "swatmf.exe",
+)
+
+
+def run_simulation(
+    swatmf_folder: str | os.PathLike,
+    exe_name: str | None = None,
+    *,
+    wait: bool = True,
+) -> subprocess.Popen:
+    """Launch the SWAT-MODFLOW executable.
+
+    Replicates the **Run simulation** button (``pushButton_run_SM → run_SM``)
+    from the QSWATMOD2 plugin.
+
+    The function searches *swatmf_folder* for a known executable in this
+    order: ``SWAT-MODFLOW3.exe`` → ``swatmf_rel230818.exe`` → ``swatmf.exe``.
+    You can override the search by passing *exe_name* explicitly.
+
+    The executable is launched with *swatmf_folder* as its working directory
+    so that all relative file paths inside the executable resolve correctly.
+
+    Parameters
+    ----------
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory (contains the executable and all input
+        files such as ``swatmf_link.txt``, ``hru_dhru``, etc.).
+    exe_name : str, optional
+        Base name (or absolute path) of the executable to run.  If omitted,
+        the function auto-detects from :data:`_EXE_CANDIDATES`.
+    wait : bool, optional
+        If ``True`` (default), block until the process finishes.
+        If ``False``, return the :class:`subprocess.Popen` object immediately
+        so the caller can monitor or terminate the process.
+
+    Returns
+    -------
+    subprocess.Popen
+        The running (or completed) process object.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no recognised SWAT-MODFLOW executable can be found in
+        *swatmf_folder* and *exe_name* is not provided.
+
+    Examples
+    --------
+    Run synchronously (block until complete):
+
+    >>> from swatmf.simulation import run_simulation
+    >>> proc = run_simulation(wd)
+    >>> print("Return code:", proc.returncode)
+
+    Run in the background and poll for completion:
+
+    >>> proc = run_simulation(wd, wait=False)
+    >>> while proc.poll() is None:
+    ...     print("Still running …")
+    >>> print("Finished with return code", proc.returncode)
+    """
+    wd = str(swatmf_folder)
+
+    if exe_name is not None:
+        # Allow either a basename or an absolute path
+        exe_path = exe_name if os.path.isabs(exe_name) else os.path.join(wd, exe_name)
+    else:
+        exe_path = None
+        for candidate in _EXE_CANDIDATES:
+            candidate_path = os.path.join(wd, candidate)
+            if os.path.isfile(candidate_path):
+                exe_path = candidate_path
+                break
+
+    if exe_path is None or not os.path.isfile(exe_path):
+        searched = ", ".join(_EXE_CANDIDATES)
+        raise FileNotFoundError(
+            f"No SWAT-MODFLOW executable found in {wd!r}.  "
+            f"Searched for: {searched}.  "
+            "Supply the exe_name parameter to specify a custom executable."
+        )
+
+    proc = subprocess.Popen(
+        os.path.normpath(exe_path),
+        cwd=wd,
+    )
+    if wait:
+        proc.wait()
+
+    return proc

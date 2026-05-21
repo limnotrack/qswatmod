@@ -21,6 +21,7 @@ read_modflow_obs       — Read an existing ``modflow.obs`` into a DataFrame.
 create_mf_model        — Build a new MODFLOW model from scratch using flopy.
 create_modflow_mfn     — Generate ``modflow.mfn`` from the MODFLOW name file.
 modify_modflow_oc      — Update unit numbers in the MODFLOW output-control file.
+check_modflow_files    — Validate MODFLOW folder; generate modflow.mfn and fix .oc.
 """
 
 from __future__ import annotations
@@ -888,3 +889,93 @@ def modify_modflow_oc(swatmf_folder: str | os.PathLike) -> str:
                 fh.write(f"{ts2} -> {entry}\n")
 
     return oc_path
+
+
+# ---------------------------------------------------------------------------
+# Check MODFLOW folder and prepare modflow.mfn / fix .oc
+# ---------------------------------------------------------------------------
+
+def check_modflow_files(swatmf_folder: str | os.PathLike) -> dict:
+    """Validate MODFLOW inputs and prepare the ``modflow.mfn`` / ``.oc`` files.
+
+    Replicates the **Check MODFLOW file** button (``pushButton_checkMF →
+    checkMF``) from the QSWATMOD2 plugin, which calls
+    ``create_modflow_mfn`` and ``modify_modflow_oc``.
+
+    Steps performed
+    ~~~~~~~~~~~~~~~
+    1. Verify that the required MODFLOW package files (``.dis``, ``.nam``,
+       ``.oc``) are present in *swatmf_folder*.
+    2. Generate ``modflow.mfn`` from the ``.nam`` file (adjusts unit numbers
+       by adding 5000 where required).
+    3. Update ``HEAD SAVE UNIT`` numbers in the ``.oc`` output-control file.
+
+    Parameters
+    ----------
+    swatmf_folder : str or path-like
+        The SWAT-MODFLOW working directory (the folder that contains the
+        MODFLOW input files — ``.dis``, ``.nam``, ``.oc``, etc.).
+
+    Returns
+    -------
+    dict
+        A summary dictionary with the following keys:
+
+        * ``"status"`` — ``"ok"`` on success, ``"warning"`` if some optional
+          files were missing.
+        * ``"dis_file"`` — path to the ``.dis`` file found.
+        * ``"nam_file"`` — path to the ``.nam`` file found.
+        * ``"oc_file"``  — path to the ``.oc`` file found (or ``None``).
+        * ``"mfn_file"`` — path to the written ``modflow.mfn`` file.
+        * ``"messages"`` — list of informational messages.
+
+    Raises
+    ------
+    FileNotFoundError
+        If the ``.dis`` or ``.nam`` file is missing from *swatmf_folder*.
+
+    Examples
+    --------
+    >>> from swatmf.preprocessing.modflow import check_modflow_files
+    >>> result = check_modflow_files(wd)
+    >>> print(result["status"])
+    ok
+    >>> for msg in result["messages"]:
+    ...     print(msg)
+    """
+    wd = str(swatmf_folder)
+    messages: list[str] = []
+    status = "ok"
+
+    # 1 — validate required files ------------------------------------------
+    dis_path = _find_single_file(wd, ".dis")   # raises if missing
+    nam_path = _find_single_file(wd, ".nam")   # raises if missing
+    messages.append(f"Found .dis  : {os.path.basename(dis_path)}")
+    messages.append(f"Found .nam  : {os.path.basename(nam_path)}")
+
+    # .oc is optional (not all MODFLOW models use it)
+    oc_files = glob.glob(os.path.join(wd, "*.oc"))
+    oc_path: str | None = oc_files[0] if oc_files else None
+    if oc_path:
+        messages.append(f"Found .oc   : {os.path.basename(oc_path)}")
+    else:
+        messages.append("No .oc file found — skipping output-control update.")
+        status = "warning"
+
+    # 2 — generate modflow.mfn from .nam -----------------------------------
+    mfn_path = create_modflow_mfn(wd)
+    messages.append(f"Written     : {os.path.basename(mfn_path)}")
+
+    # 3 — fix .oc unit numbers ---------------------------------------------
+    if oc_path:
+        oc_out = modify_modflow_oc(wd)
+        messages.append(f"Updated     : {os.path.basename(oc_out)}")
+
+    return {
+        "status":   status,
+        "dis_file": dis_path,
+        "nam_file": nam_path,
+        "oc_file":  oc_path,
+        "mfn_file": mfn_path,
+        "messages": messages,
+    }

@@ -5,13 +5,17 @@ Pure-Python / GeoPandas functions that replicate the **Linking Process**
 panel of the QSWATMOD2 QGIS plugin.
 
 The linking process spatially joins SWAT HRU polygons with the MODFLOW grid
-and writes two tab-delimited ASCII tables that the SWAT-MODFLOW executable
+and writes three tab-delimited ASCII tables that the SWAT-MODFLOW executable
 reads at run-time:
 
 ``hru_dhru``
     Maps each disaggregated HRU (dHRU) to its parent HRU and subbasin.
 ``dhru_grid``
-    Maps each dHRU fragment to the MODFLOW grid cells it overlaps.
+    Maps each dHRU fragment to the MODFLOW grid cells it overlaps
+    (sorted by grid_id × dhru_id).
+``grid_dhru``
+    Inverse mapping of ``dhru_grid`` sorted by dhru_id × grid_id;
+    header also carries ``nrow`` and ``ncol`` from the MODFLOW ``.dis`` file.
 
 These files were previously only generated inside QGIS.  This module
 reproduces the same pipeline using :mod:`geopandas` so that the full
@@ -24,7 +28,8 @@ build_hru_dhru           — Intersect dHRUs × subbasins → hru_dhru GeoDataFr
 export_hru_dhru          — Write ``hru_dhru`` table file from a GeoDataFrame.
 build_dhru_grid          — Intersect dHRUs × MODFLOW grid → dhru_grid GeoDataFrame.
 export_dhru_grid         — Write ``dhru_grid`` table file from a GeoDataFrame.
-generate_link_tables     — Full pipeline: HRU + sub + mf_grid → both table files.
+export_grid_dhru         — Write ``grid_dhru`` table file from a GeoDataFrame.
+generate_link_tables     — Full pipeline: HRU + sub + mf_grid → all three table files.
 
 Notes
 -----
@@ -33,7 +38,7 @@ SWAT-MODFLOW executable expects integer values, so areas are rounded before
 they are written.
 
 The ``area_filter_m2`` thresholds (default 9 m² for hru_dhru and 30 m² for
-dhru_grid) match the sliver-removal thresholds used in the QGIS plugin.
+dhru_grid / grid_dhru) match the sliver-removal thresholds used in the QGIS plugin.
 """
 
 from __future__ import annotations
@@ -423,6 +428,84 @@ def export_dhru_grid(
 
 
 # ---------------------------------------------------------------------------
+# Export grid_dhru table
+# ---------------------------------------------------------------------------
+
+def export_grid_dhru(
+    dhru_grid_gdf: gpd.GeoDataFrame,
+    table_dir: str | os.PathLike,
+    *,
+    nrow: int | None = None,
+    ncol: int | None = None,
+) -> str:
+    """Write the ``grid_dhru`` link table to *table_dir*.
+
+    ``grid_dhru`` is the inverse-sort companion to ``dhru_grid``: the data
+    are identical but sorted by **dhru_id × grid_id** instead of
+    grid_id × dhru_id.  The header also carries ``nrow`` and ``ncol`` from
+    the MODFLOW discretisation file.
+
+    File format::
+
+        <n_records>           # total number of data rows
+        <n_unique_dhru>       # number of unique dHRU IDs
+        <nrow>                # MODFLOW grid rows  (0 if not supplied)
+        <ncol>                # MODFLOW grid columns (0 if not supplied)
+        grid_id grid_area dhru_id overlap_area dhru_area
+        <data rows …>
+
+    Parameters
+    ----------
+    dhru_grid_gdf : GeoDataFrame
+        Output of :func:`build_dhru_grid`.
+    table_dir : str or path-like
+        Destination folder (``GIS/Table`` in the QSWATMOD2 project).
+    nrow : int, optional
+        Number of MODFLOW grid rows (read from ``.dis`` file).
+        Written as ``0`` if not supplied.
+    ncol : int, optional
+        Number of MODFLOW grid columns.  Written as ``0`` if not supplied.
+
+    Returns
+    -------
+    str
+        Absolute path to the written file.
+
+    Examples
+    --------
+    >>> from swatmf.preprocessing.modflow import parse_dis_file
+    >>> dis = parse_dis_file(wd)
+    >>> path = export_grid_dhru(dg, paths.table_folder, nrow=dis.nrow, ncol=dis.ncol)
+    >>> print("Written to:", path)
+    """
+    df = dhru_grid_gdf.sort_values(["dhru_id", "grid_id"]).reset_index(drop=True)
+
+    n_records    = len(df)
+    n_unique_dhru = int(df["dhru_id"].nunique())
+
+    os.makedirs(str(table_dir), exist_ok=True)
+    output_file = os.path.normpath(os.path.join(str(table_dir), "grid_dhru"))
+
+    with open(output_file, "w", newline="") as fh:
+        writer = csv.writer(fh, delimiter="\t")
+        writer.writerow([str(n_records)])
+        writer.writerow([str(n_unique_dhru)])
+        writer.writerow([str(nrow if nrow is not None else 0)])
+        writer.writerow([str(ncol if ncol is not None else 0)])
+        writer.writerow(["grid_id grid_area dhru_id overlap_area dhru_area"])
+        for _, row in df.iterrows():
+            writer.writerow([
+                f"{int(row['grid_id']):>10d}",
+                f"{int(round(row['grid_area'])):>14d}",
+                f"{int(row['dhru_id']):>10d}",
+                f"{int(round(row['ol_area'])):>14d}",
+                f"{int(round(row['dhru_area'])):>14d}",
+            ])
+
+    return output_file
+
+
+# ---------------------------------------------------------------------------
 # High-level convenience function
 # ---------------------------------------------------------------------------
 
@@ -432,6 +515,7 @@ def generate_link_tables(
     mfgrid_path: str | os.PathLike,
     table_dir: str | os.PathLike,
     *,
+    swatmf_folder: str | os.PathLike | None = None,
     hru_id_col: str = "HRU_ID",
     hrugis_col: str = "HRUGIS",
     subbasin_col: str = "Subbasin",
@@ -442,16 +526,16 @@ def generate_link_tables(
     save_intermediate: bool = False,
     intermediate_dir: str | os.PathLike | None = None,
 ) -> dict[str, str]:
-    """Full SWAT-MODFLOW linking pipeline — generate ``hru_dhru`` and ``dhru_grid``.
+    """Full SWAT-MODFLOW linking pipeline — generate ``hru_dhru``, ``dhru_grid``, and ``grid_dhru``.
 
-    This function replicates the complete **Linking Process** sequence from
-    the QSWATMOD2 plugin:
+    This function replicates the complete **Linking Process** sequence
+    (``geoprocessing_prepared``) from the QSWATMOD2 plugin:
 
     1. Load HRU, subbasin, and MODFLOW grid shapefiles.
     2. Disaggregate multipart HRU polygons → singlepart dHRUs.
     3. Intersect dHRUs × subbasins → ``hru_dhru`` table.
-    4. Intersect dHRUs × MODFLOW grid → ``dhru_grid`` table.
-    5. Write both tab-delimited files to *table_dir*.
+    4. Intersect dHRUs × MODFLOW grid → ``dhru_grid`` and ``grid_dhru`` tables.
+    5. Write all tab-delimited files to *table_dir*.
 
     Parameters
     ----------
@@ -469,6 +553,11 @@ def generate_link_tables(
     table_dir : str or path-like
         Output directory for the link table files (``GIS/Table``).
 
+    swatmf_folder : str or path-like, optional
+        SWAT-MODFLOW working directory.  When provided, the ``.dis`` file is
+        read to embed ``nrow`` and ``ncol`` in the ``grid_dhru`` header (as
+        the QGIS plugin does).  If omitted, ``nrow`` and ``ncol`` default to
+        the grid dimensions inferred from the MODFLOW grid shapefile.
     hru_id_col : str, optional
         Column name for the integer HRU ID in the HRU shapefile.
         Default ``"HRU_ID"``.
@@ -487,7 +576,8 @@ def generate_link_tables(
     hru_area_filter_m2 : float, optional
         Sliver-removal threshold for ``hru_dhru`` [m²].  Default 9.
     grid_area_filter_m2 : float, optional
-        Sliver-removal threshold for ``dhru_grid`` [m²].  Default 30.
+        Sliver-removal threshold for ``dhru_grid`` / ``grid_dhru`` [m²].
+        Default 30.
     save_intermediate : bool, optional
         If ``True``, write the intermediate ``dhru``, ``hru_dhru``, and
         ``dhru_grid`` GeoPackages to *intermediate_dir* for inspection.
@@ -498,7 +588,7 @@ def generate_link_tables(
     Returns
     -------
     dict
-        ``{"hru_dhru": <path>, "dhru_grid": <path>}``
+        ``{"hru_dhru": <path>, "dhru_grid": <path>, "grid_dhru": <path>}``
 
     Examples
     --------
@@ -508,13 +598,14 @@ def generate_link_tables(
     >>> paths = Paths("/data/my_project", "my_project")
     >>>
     >>> result = generate_link_tables(
-    ...     hru_path    = paths.sm_shps + "/hru_link.gpkg",
-    ...     sub_path    = paths.sm_shps + "/sub_link.gpkg",
-    ...     mfgrid_path = paths.sm_shps + "/mf_grid.gpkg",
-    ...     table_dir   = paths.table_folder,
+    ...     hru_path       = paths.sm_shps + "/hru_link.gpkg",
+    ...     sub_path       = paths.sm_shps + "/sub_link.gpkg",
+    ...     mfgrid_path    = paths.sm_shps + "/mf_grid.gpkg",
+    ...     table_dir      = paths.table_folder,
+    ...     swatmf_folder  = paths.swatmf_folder,
     ... )
     >>> print(result)
-    {'hru_dhru': '.../GIS/Table/hru_dhru', 'dhru_grid': '.../GIS/Table/dhru_grid'}
+    {'hru_dhru': '...', 'dhru_grid': '...', 'grid_dhru': '...'}
     """
     # 1 — load inputs
     hru_gdf    = _fix_geometries(gpd.read_file(str(hru_path)))
@@ -545,16 +636,39 @@ def generate_link_tables(
         area_filter_m2=grid_area_filter_m2,
     )
 
-    # 5 — write table files
+    # 5a — determine nrow / ncol for grid_dhru header
+    nrow: int | None = None
+    ncol: int | None = None
+    if swatmf_folder is not None:
+        try:
+            from swatmf.preprocessing.modflow import parse_dis_file
+            dis = parse_dis_file(swatmf_folder)
+            nrow, ncol = dis.nrow, dis.ncol
+        except Exception:
+            pass  # fall back to inferring from grid shapefile
+
+    if nrow is None or ncol is None:
+        # Infer from the grid shapefile's bounding-box aspect ratio
+        n_cells = len(mfgrid_gdf)
+        # count distinct grid_id values to see if it's a complete grid
+        n_ids = mfgrid_gdf[grid_id_col].nunique() if grid_id_col in mfgrid_gdf.columns else n_cells
+        # simple square-root estimate — works for regular grids
+        import math
+        _side = int(math.sqrt(n_ids))
+        nrow = _side
+        ncol = n_ids // _side if _side > 0 else n_ids
+
+    # 5b — write table files
     hd_path = export_hru_dhru(hru_dhru_gdf, table_dir)
     dg_path = export_dhru_grid(dhru_grid_gdf, mfgrid_gdf, table_dir, grid_id_col=grid_id_col)
+    gd_path = export_grid_dhru(dhru_grid_gdf, table_dir, nrow=nrow, ncol=ncol)
 
     # optional: save intermediate GeoPackages for QA/QC
     if save_intermediate:
         idir = str(intermediate_dir or table_dir)
         os.makedirs(idir, exist_ok=True)
-        dhru_gdf.to_file(os.path.join(idir, "dhru_link.gpkg"),      driver="GPKG")
+        dhru_gdf.to_file(os.path.join(idir, "dhru_link.gpkg"),         driver="GPKG")
         hru_dhru_gdf.to_file(os.path.join(idir, "hru_dhru_link.gpkg"), driver="GPKG")
         dhru_grid_gdf.to_file(os.path.join(idir, "dhru_grid_link.gpkg"), driver="GPKG")
 
-    return {"hru_dhru": hd_path, "dhru_grid": dg_path}
+    return {"hru_dhru": hd_path, "dhru_grid": dg_path, "grid_dhru": gd_path}
