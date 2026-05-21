@@ -52,7 +52,7 @@ The sections below follow the same tabs as the QSWATMOD2 plugin:
 from swatmf import Paths, parse_file_cio
 
 # ── Edit these two variables to point at your project ──────────────────────
-PROJECT_DIR  = "/path/to/your/qgis/project/folder"
+PROJECT_DIR  = "C:/Users/data/Downloads/swat-modflow3(1)/Files/r_test/"
 PROJECT_NAME = "test"
 # ───────────────────────────────────────────────────────────────────────────
 
@@ -359,6 +359,9 @@ from swatmf.preprocessing.linking import generate_link_tables
 hru_path    = os.path.join(paths.sm_shps, "hru_link.gpkg")
 sub_path    = os.path.join(paths.sm_shps, "sub_link.gpkg")
 mfgrid_path = os.path.join(paths.sm_shps, "mf_grid.gpkg")
+hru_path = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model shapefiles/hru1.shp"
+sub_path = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model shapefiles/subs1.shp"
+mfgrid_path = "C:/Users/data/Downloads/swat-modflow3(1)/Files/2 MODFLOW LRW/MODFLOW model shapefiles/MODFLOW_Grid.shp"
 # ────────────────────────────────────────────────────────────────────────────
 
 result = generate_link_tables(
