@@ -22,6 +22,10 @@ create_mf_model        — Build a new MODFLOW model from scratch using flopy.
 create_modflow_mfn     — Generate ``modflow.mfn`` from the MODFLOW name file.
 modify_modflow_oc      — Update unit numbers in the MODFLOW output-control file.
 check_modflow_files    — Validate MODFLOW folder; generate modflow.mfn and fix .oc.
+create_mf_grid         — Build the ``mf_grid.gpkg`` polygon grid from a .dis file
+                         and NW-corner coordinates (MODFLOW Option 2 / Scenario B).
+import_mf_grid         — Import an existing grid shapefile/GeoPackage and annotate it
+                         with grid_id, row, col, top_elev (MODFLOW Option 1 / Scenario A).
 """
 
 from __future__ import annotations
@@ -979,3 +983,279 @@ def check_modflow_files(swatmf_folder: str | os.PathLike) -> dict:
         "mfn_file": mfn_path,
         "messages": messages,
     }
+
+
+# ---------------------------------------------------------------------------
+# Create mf_grid GeoPackage from a MODFLOW .dis file and NW corner coordinates
+# ---------------------------------------------------------------------------
+
+def create_mf_grid(
+    swatmf_folder: str | os.PathLike,
+    x_origin: float,
+    y_origin: float,
+    *,
+    crs: str | int | None = None,
+    output_dir: str | os.PathLike | None = None,
+    extra_cols: int = 0,
+    extra_rows: int = 0,
+    output_filename: str = "mf_grid.gpkg",
+) -> str:
+    """Build the MODFLOW grid polygon GeoPackage from a ``.dis`` file.
+
+    Replicates the **Create Grid** button (``pushButton_createMF → createMF
+    → MF_grid → create_grid_id → create_row → create_col → create_top_elev``)
+    from the QSWATMOD2 plugin.  This is the pure-Python / GeoPandas equivalent
+    for **MODFLOW Option 2 / Scenario B** — MODFLOW input files exist but no
+    ``mf_grid`` shapefile is available yet.
+
+    The function reads the ``.dis`` file to determine the grid dimensions,
+    builds one rectangular polygon per cell in row-major order, and annotates
+    every cell with ``grid_id``, ``row``, ``col``, and ``top_elev`` attributes.
+
+    Parameters
+    ----------
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory (must contain a ``.dis`` file).
+    x_origin : float
+        X coordinate (easting) of the **north-west corner** of the grid
+        [same units as the model CRS, typically metres].
+    y_origin : float
+        Y coordinate (northing) of the north-west corner of the grid.
+    crs : str, int, or None, optional
+        Coordinate reference system for the output GeoPackage — any value
+        accepted by :func:`pyproj.CRS.from_user_input` (e.g. ``"EPSG:27700"``
+        or an integer EPSG code).  If ``None``, no CRS is assigned; the layer
+        will still be created and usable but QGIS will show a warning.
+    output_dir : str or path-like, optional
+        Directory where the GeoPackage is written.  Defaults to
+        *swatmf_folder*.
+    extra_cols : int, optional
+        Number of extra columns to add to the right of the grid (replicates
+        the ``spinBox_col`` extra-column expansion feature in the plugin).
+        Default 0.
+    extra_rows : int, optional
+        Number of extra rows to add below the grid (replicates
+        ``spinBox_row``).  Default 0.
+    output_filename : str, optional
+        Name of the output GeoPackage file.  Default ``"mf_grid.gpkg"``.
+
+    Returns
+    -------
+    str
+        Absolute path to the written ``mf_grid.gpkg`` GeoPackage.
+
+    Raises
+    ------
+    FileNotFoundError
+        If no ``.dis`` file is found in *swatmf_folder*.
+    ImportError
+        If :mod:`geopandas` or :mod:`shapely` are not installed.
+
+    Examples
+    --------
+    >>> from swatmf.preprocessing.modflow import create_mf_grid
+    >>> path = create_mf_grid(
+    ...     wd,
+    ...     x_origin=367000.0,
+    ...     y_origin=6234000.0,
+    ...     crs="EPSG:27700",
+    ... )
+    >>> print("mf_grid written to:", path)
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+    except ImportError as exc:
+        raise ImportError(
+            "geopandas and shapely are required for create_mf_grid.  "
+            "Install with: pip install geopandas"
+        ) from exc
+
+    wd = str(swatmf_folder)
+    out_dir = str(output_dir) if output_dir is not None else wd
+    os.makedirs(out_dir, exist_ok=True)
+
+    dis = parse_dis_file(wd)
+    nrow  = dis.nrow  + extra_rows
+    ncol  = dis.ncol  + extra_cols
+    delr  = dis.delr
+    delc  = dis.delc
+    # top elevations come from the original (un-extended) grid — pad extras
+    # with the mean elevation so they do not break downstream workflows.
+    top_elevs_base = list(dis.top_elevs)
+    mean_elev = float(np.mean(top_elevs_base)) if top_elevs_base else 0.0
+    # For an extended grid repeat the mean for any extra cells
+    n_orig = dis.nrow * dis.ncol
+    top_elevs_ext = top_elevs_base + [mean_elev] * (nrow * ncol - n_orig)
+
+    rows_list: list[int] = []
+    cols_list: list[int] = []
+    grid_ids:  list[int] = []
+    geoms:     list[Polygon] = []
+
+    gid = 1
+    for r in range(1, nrow + 1):
+        for c in range(1, ncol + 1):
+            x_left  = x_origin + (c - 1) * delc
+            x_right = x_origin +  c      * delc
+            y_top   = y_origin - (r - 1) * delr
+            y_bot   = y_origin -  r      * delr
+            geoms.append(Polygon([
+                (x_left,  y_top),
+                (x_right, y_top),
+                (x_right, y_bot),
+                (x_left,  y_bot),
+                (x_left,  y_top),
+            ]))
+            grid_ids.append(gid)
+            rows_list.append(r)
+            cols_list.append(c)
+            gid += 1
+
+    gdf = gpd.GeoDataFrame(
+        {
+            "grid_id":  grid_ids,
+            "row":      rows_list,
+            "col":      cols_list,
+            "top_elev": top_elevs_ext,
+        },
+        geometry=geoms,
+        crs=crs,
+    )
+
+    out_path = os.path.normpath(os.path.join(out_dir, output_filename))
+    gdf.to_file(out_path, driver="GPKG")
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Import an existing MODFLOW grid shapefile / GeoPackage and annotate it
+# ---------------------------------------------------------------------------
+
+def import_mf_grid(
+    src_path: str | os.PathLike,
+    swatmf_folder: str | os.PathLike,
+    *,
+    output_dir: str | os.PathLike | None = None,
+    output_filename: str = "mf_grid.gpkg",
+    grid_id_col: str | None = None,
+    row_col: str | None = None,
+    col_col: str | None = None,
+) -> str:
+    """Import an existing MODFLOW grid shapefile/GeoPackage and annotate it.
+
+    Replicates the **Import MF grid shapefile** button
+    (``pushButton_MF_grid_shapefile → import_mf_grid → create_grid_id →
+    create_row → create_col → create_top_elev``) from the QSWATMOD2 plugin.
+    This is the pure-Python / GeoPandas equivalent for **MODFLOW Option 1 /
+    Scenario A** — a pre-existing ``mf_grid`` shapefile is available.
+
+    The function:
+
+    1. Reads *src_path* into a GeoDataFrame and fixes any geometry errors.
+    2. Adds ``grid_id`` (1-based sequential integer) if absent.
+    3. Derives ``row`` and ``col`` from the ``.dis`` file if absent.
+    4. Joins ``top_elev`` from the ``.dis`` land-surface array if absent.
+    5. Writes the annotated grid as ``mf_grid.gpkg`` in *output_dir*.
+
+    Parameters
+    ----------
+    src_path : str or path-like
+        Path to the source MODFLOW grid shapefile (``.shp``) or GeoPackage
+        (``.gpkg``).
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory (must contain a ``.dis`` file used to
+        derive ``row``, ``col``, and ``top_elev``).
+    output_dir : str or path-like, optional
+        Destination directory for the output GeoPackage.  Defaults to
+        *swatmf_folder*.
+    output_filename : str, optional
+        Name of the output file.  Default ``"mf_grid.gpkg"``.
+    grid_id_col : str, optional
+        If the source file already contains a grid-cell ID column under a
+        different name, supply that name here and it will be renamed to
+        ``"grid_id"``.  If ``None``, ``grid_id`` will be created (1 … N).
+    row_col : str, optional
+        Existing column name for row numbers.  If ``None``, ``row`` is
+        computed from the ``.dis`` file.
+    col_col : str, optional
+        Existing column name for column numbers.  If ``None``, ``col`` is
+        computed from the ``.dis`` file.
+
+    Returns
+    -------
+    str
+        Absolute path to the written ``mf_grid.gpkg``.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *src_path* does not exist or no ``.dis`` file is in
+        *swatmf_folder*.
+    ImportError
+        If :mod:`geopandas` is not installed.
+
+    Examples
+    --------
+    >>> from swatmf.preprocessing.modflow import import_mf_grid
+    >>> path = import_mf_grid(
+    ...     src_path="C:/data/MODFLOW_Grid.shp",
+    ...     swatmf_folder=wd,
+    ... )
+    >>> print("mf_grid written to:", path)
+    """
+    try:
+        import geopandas as gpd
+    except ImportError as exc:
+        raise ImportError(
+            "geopandas is required for import_mf_grid.  "
+            "Install with: pip install geopandas"
+        ) from exc
+
+    src = str(src_path)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"Source grid file not found: {src!r}")
+
+    wd = str(swatmf_folder)
+    out_dir = str(output_dir) if output_dir is not None else wd
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 1 — load and fix geometries
+    gdf = gpd.read_file(src)
+    gdf["geometry"] = gdf.geometry.buffer(0)  # fix minor topology errors
+
+    # 2 — add / rename grid_id
+    if grid_id_col is not None and grid_id_col in gdf.columns:
+        if grid_id_col != "grid_id":
+            gdf = gdf.rename(columns={grid_id_col: "grid_id"})
+    if "grid_id" not in gdf.columns:
+        gdf = gdf.reset_index(drop=True)
+        gdf["grid_id"] = gdf.index + 1
+
+    # 3 — add row / col from .dis if not already present
+    if (row_col is None or row_col not in gdf.columns) and "row" not in gdf.columns:
+        dis = parse_dis_file(wd)
+        rows_all, cols_all = grid_row_col(dis)
+        n = len(gdf)
+        gdf["row"] = rows_all[:n]
+        gdf["col"] = cols_all[:n]
+    else:
+        if row_col and row_col != "row" and row_col in gdf.columns:
+            gdf = gdf.rename(columns={row_col: "row"})
+        if col_col and col_col != "col" and col_col in gdf.columns:
+            gdf = gdf.rename(columns={col_col: "col"})
+
+    # 4 — add top_elev from .dis if not already present
+    if "top_elev" not in gdf.columns:
+        if not locals().get("dis"):
+            dis = parse_dis_file(wd)
+        top_elevs = dis.top_elevs
+        n = len(gdf)
+        gdf["top_elev"] = top_elevs[:n] if len(top_elevs) >= n else (
+            top_elevs + [float(np.mean(top_elevs))] * (n - len(top_elevs))
+        )
+
+    # 5 — write output
+    out_path = os.path.normpath(os.path.join(out_dir, output_filename))
+    gdf.to_file(out_path, driver="GPKG")
+    return out_path
