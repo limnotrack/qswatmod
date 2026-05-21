@@ -44,6 +44,7 @@ dhru_grid / grid_dhru) match the sliver-removal thresholds used in the QGIS plug
 from __future__ import annotations
 
 import csv
+import math
 import os
 from typing import Union
 
@@ -653,7 +654,6 @@ def generate_link_tables(
         # count distinct grid_id values to see if it's a complete grid
         n_ids = mfgrid_gdf[grid_id_col].nunique() if grid_id_col in mfgrid_gdf.columns else n_cells
         # simple square-root estimate — works for regular grids
-        import math
         _side = int(math.sqrt(n_ids))
         nrow = _side
         ncol = n_ids // _side if _side > 0 else n_ids
