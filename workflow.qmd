@@ -58,6 +58,7 @@ PROJECT_NAME = "test"
 
 paths = Paths(PROJECT_DIR, PROJECT_NAME)
 wd    = paths.swatmf_folder          # SWAT-MODFLOW working directory
+wd = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model/TxtInOut"
 out   = paths.exported_files         # where output files are written
 
 print("SWAT-MODFLOW folder :", wd)
@@ -374,8 +375,8 @@ import geopandas as gpd
 from swatmf.preprocessing.linking import generate_link_tables
 
 # ── Input file paths ─────────────────────────────────────────────────────────
-hru_path    = os.path.join(paths.sm_shps, "hru_link.gpkg")
-sub_path    = os.path.join(paths.sm_shps, "sub_link.gpkg")
+hru_path    = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model shapefiles/hru1.shp"
+sub_path    = "C:/Users/data/Downloads/swat-modflow3(1)/Files/1 SWAT LRW/SWAT Model shapefiles/subs1.shp"
 mfgrid_path = os.path.join(paths.sm_shps, "mf_grid.gpkg")
 # ────────────────────────────────────────────────────────────────────────────
 
