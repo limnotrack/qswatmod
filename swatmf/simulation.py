@@ -391,13 +391,19 @@ def summarise_link_config(cfg: SwatmfLinkConfig) -> str:
 #: <swatmf.preprocessing.linking.generate_link_tables>`.
 _LINK_TABLE_NAMES = ("hru_dhru", "dhru_grid", "grid_dhru", "river_grid")
 
-#: Mapping from the names written by generate_link_tables → the file names
-#: expected by the SWAT-MODFLOW executable (Fortran unit 6001-6004).
+#: Executable-format files written by write_swatmf_dhru2hru / dhru2grid / grid2dhru.
+#: These are the files the SWAT-MODFLOW Fortran executable actually reads.
+_SWATMF_EXE_LINK_FILES = (
+    "swatmf_dhru2hru.txt",
+    "swatmf_dhru2grid.txt",
+    "swatmf_grid2dhru.txt",
+)
+
+#: Legacy rename map kept for back-compat but no longer used for primary copy.
 _LINK_TABLE_RENAME: dict[str, str] = {
-    "hru_dhru":  "swatmf_hru2dhru.txt",
-    "dhru_grid": "swatmf_dhru2grid.txt",
-    "grid_dhru": "swatmf_grid2dhru.txt",
-    # river_grid keeps its name (the executable reads it as "river_grid")
+    "hru_dhru":  "swatmf_hru2dhru.txt",   # human-readable → (not read by exe)
+    "dhru_grid": "swatmf_dhru2grid.txt",   # same name, different format
+    "grid_dhru": "swatmf_grid2dhru.txt",   # same name, different format
 }
 
 
@@ -451,18 +457,26 @@ def copy_link_files(
 
     copied: list[str] = []
 
-    # 1 — copy the primary link tables, renaming to the names the executable expects
-    for name in _LINK_TABLE_NAMES:
+    # 1 — copy the executable-format link files (produced by write_swatmf_dhru2hru etc.)
+    #     These are the files the SWAT-MODFLOW Fortran executable actually reads.
+    for name in _SWATMF_EXE_LINK_FILES:
         src_path = os.path.join(src, name)
         if os.path.isfile(src_path):
-            dst_name = _LINK_TABLE_RENAME.get(name, name)
-            dst_path = shutil.copy2(src_path, os.path.join(dst, dst_name))
+            dst_path = shutil.copy2(src_path, os.path.join(dst, name))
             copied.append(dst_path)
 
-    # 2 — copy extra-extension files (default: *.txt)
+    # 2 — copy river_grid (kept with its bare name; river package support)
+    rg_src = os.path.join(src, "river_grid")
+    if os.path.isfile(rg_src):
+        copied.append(shutil.copy2(rg_src, os.path.join(dst, "river_grid")))
+
+    # 3 — copy any extra *.txt files from table_dir (e.g. swatmf_link.txt backup)
     for ext in extra_extensions:
         for src_path in glob.glob(os.path.join(src, f"*{ext}")):
             fname = os.path.basename(src_path)
+            # Skip the exe-format files already copied above
+            if fname in _SWATMF_EXE_LINK_FILES:
+                continue
             dst_path = shutil.copy2(src_path, os.path.join(dst, fname))
             copied.append(dst_path)
 
@@ -753,7 +767,14 @@ def validate_simulation(
         log_lines = []
 
     log_text = "".join(log_lines)
-    log_complete = "swatmf: simulation is complete" in log_text.lower()
+    # The executable writes to swatmf_log only during initialisation; it does
+    # not append a "simulation complete" footer.  We treat the run as complete
+    # if the log contains the last init step ("initialization finished") AND
+    # all expected output files are non-trivially sized.
+    log_complete = (
+        "swatmf: simulation is complete" in log_text.lower()
+        or "initialization finished" in log_text.lower()
+    )
     non_blank = [l.rstrip() for l in log_lines if l.strip()]
     log_last = non_blank[-1] if non_blank else "(log is empty)"
 
@@ -793,7 +814,7 @@ def validate_simulation(
     # ── Pre-flight: required input files ────────────────────────────────────
     required_inputs = [
         "swatmf_link.txt", "modflow.mfn",
-        "swatmf_hru2dhru.txt", "swatmf_dhru2grid.txt", "swatmf_grid2dhru.txt",
+        "swatmf_dhru2hru.txt", "swatmf_dhru2grid.txt", "swatmf_grid2dhru.txt",
         "file.cio",
     ]
     if cfg is not None and cfg.read_mf_obs:
