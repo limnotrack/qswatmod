@@ -212,7 +212,7 @@ def write_swatmf_link(
         f"{_flag(cfg.drain_cells)}    MODFLOW Drains --> SWAT subbasin channels\n",
         f"{_flag(cfg.rt3d_active)}    RT3D is active (N and P groundwater reactive transport)\n",
         f"{_flag(cfg.read_mf_obs)}    Read in observation cells from \"modflow.obs\"\n",
-        "# Optional output for SWAT-MODFLOW (0=no; 1=yes)\n",
+        "Optional output for SWAT-MODFLOW (0=no; 1=yes)\n",
         f"{_flag(cfg.output_swat_dp)}    SWAT Deep Percolation (mm) (for each HRU)\n",
         f"{_flag(cfg.output_mf_recharge)}    MODFLOW Recharge (m3/day) (for each MODFLOW Cell)\n",
         f"{_flag(cfg.output_channel_depth)}    SWAT Channel Depth (m) (for each SWAT Subbasin)\n",
@@ -223,12 +223,12 @@ def write_swatmf_link(
     ]
 
     if sim_period is not None:
-        lines.append("# == Write SWAT-MODFLOW output only on specified days ==\n")
+        lines.append("Write SWAT-MODFLOW output only on specified days\n")
         days = _output_days(sim_period, cfg.output_step)
         lines.append(f"{len(days)}\n")
         lines.extend(f"{d}\n" for d in days)
 
-        lines.append("# == Groundwater delay ==\n")
+        lines.append("Groundwater delay\n")
         if cfg.gw_delay_per_hru and cfg.gw_delay_values:
             lines.append(
                 "1    0 = read in a single value for all HRUs; "
@@ -391,6 +391,15 @@ def summarise_link_config(cfg: SwatmfLinkConfig) -> str:
 #: <swatmf.preprocessing.linking.generate_link_tables>`.
 _LINK_TABLE_NAMES = ("hru_dhru", "dhru_grid", "grid_dhru", "river_grid")
 
+#: Mapping from the names written by generate_link_tables → the file names
+#: expected by the SWAT-MODFLOW executable (Fortran unit 6001-6004).
+_LINK_TABLE_RENAME: dict[str, str] = {
+    "hru_dhru":  "swatmf_hru2dhru.txt",
+    "dhru_grid": "swatmf_dhru2grid.txt",
+    "grid_dhru": "swatmf_grid2dhru.txt",
+    # river_grid keeps its name (the executable reads it as "river_grid")
+}
+
 
 def copy_link_files(
     table_dir: str | os.PathLike,
@@ -442,11 +451,12 @@ def copy_link_files(
 
     copied: list[str] = []
 
-    # 1 — copy the primary link tables (no extension)
+    # 1 — copy the primary link tables, renaming to the names the executable expects
     for name in _LINK_TABLE_NAMES:
         src_path = os.path.join(src, name)
         if os.path.isfile(src_path):
-            dst_path = shutil.copy2(src_path, os.path.join(dst, name))
+            dst_name = _LINK_TABLE_RENAME.get(name, name)
+            dst_path = shutil.copy2(src_path, os.path.join(dst, dst_name))
             copied.append(dst_path)
 
     # 2 — copy extra-extension files (default: *.txt)
@@ -783,7 +793,7 @@ def validate_simulation(
     # ── Pre-flight: required input files ────────────────────────────────────
     required_inputs = [
         "swatmf_link.txt", "modflow.mfn",
-        "hru_dhru", "dhru_grid", "grid_dhru",
+        "swatmf_hru2dhru.txt", "swatmf_dhru2grid.txt", "swatmf_grid2dhru.txt",
         "file.cio",
     ]
     if cfg is not None and cfg.read_mf_obs:
