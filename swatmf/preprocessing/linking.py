@@ -509,6 +509,168 @@ def export_grid_dhru(
 
 
 # ---------------------------------------------------------------------------
+# Write SWAT-MODFLOW executable input files (CreateSWATMF.exe format)
+#
+# These three functions replicate what the companion utility CreateSWATMF.exe
+# produces from the GIS link tables.  The SWAT-MODFLOW executable reads these
+# dense, variable-length files — NOT the human-readable tab-delimited tables
+# produced by export_hru_dhru / export_dhru_grid / export_grid_dhru.
+#
+# Format rule: each block of n integers is written on ONE line with %13d
+# formatting; each block of n fractions on ONE line with %13.5f.
+# ---------------------------------------------------------------------------
+
+def _fmt_ints(vals: list) -> str:
+    """Format a sequence of integers as a single 13-wide-field line."""
+    return "".join(f"{int(v):13d}" for v in vals) + "\r\n"
+
+
+def _fmt_floats(vals: list) -> str:
+    """Format a sequence of floats as a single 13.5f-wide-field line."""
+    return "".join(f"{float(v):13.5f}" for v in vals) + "\r\n"
+
+
+def write_swatmf_dhru2hru(
+    hru_dhru_gdf: "gpd.GeoDataFrame",
+    table_dir: str | os.PathLike,
+) -> str:
+    """Write ``swatmf_dhru2hru.txt`` in the format read by SWAT-MODFLOW.
+
+    For each HRU lists the dHRUs it contains and the fractional area each
+    dHRU contributes to that HRU (area_overlap / sum_of_overlaps_in_HRU).
+
+    File format::
+
+        <n_HRUs>  <max_dhru_per_HRU>
+        <hru_id>  <n_dhrus>  <subbasin>
+        <dhru_id_1>  ...  <dhru_id_n>
+        <frac_1>   ...  <frac_n>
+        ... (one block per HRU)
+    """
+    df = hru_dhru_gdf.copy()
+
+    hru_info: dict[int, tuple[int, list[int], list[float]]] = {}
+    for hru_id, grp in df.groupby("HRU_ID"):
+        grp = grp.sort_values("dhru_id")
+        sub = int(grp["Subbasin"].iloc[0])
+        dhru_ids = grp["dhru_id"].astype(int).tolist()
+        areas = grp["area_f"].tolist()
+        total = sum(areas) or 1.0
+        fracs = [a / total for a in areas]
+        hru_info[int(hru_id)] = (sub, dhru_ids, fracs)
+
+    n_hrus = len(hru_info)
+    max_dhru = max(len(v[1]) for v in hru_info.values()) if hru_info else 0
+
+    os.makedirs(str(table_dir), exist_ok=True)
+    out_path = os.path.join(str(table_dir), "swatmf_dhru2hru.txt")
+    with open(out_path, "w", newline="") as fh:
+        fh.write(_fmt_ints([n_hrus, max_dhru]))
+        for hru_id in sorted(hru_info.keys()):
+            sub, dhru_ids, fracs = hru_info[hru_id]
+            fh.write(_fmt_ints([hru_id, len(dhru_ids), sub]))
+            fh.write(_fmt_ints(dhru_ids))
+            fh.write(_fmt_floats(fracs))
+    return out_path
+
+
+def write_swatmf_dhru2grid(
+    dhru_grid_gdf: "gpd.GeoDataFrame",
+    n_grid_cells: int,
+    table_dir: str | os.PathLike,
+) -> str:
+    """Write ``swatmf_dhru2grid.txt`` in the format read by SWAT-MODFLOW.
+
+    Lists ALL grid cells (1 … n_grid_cells), including those with no dHRU.
+    For non-empty cells gives the dHRU IDs and fractional coverage
+    (overlap_area / grid_area).
+
+    File format::
+
+        <n_grid_cells>  <max_dhru_per_cell>
+        <grid_id>  <n_dhrus>
+        [<dhru_id_1>  ...  <dhru_id_n>]          (only if n_dhrus > 0)
+        [<frac_1>    ...  <frac_n>   ]
+        ... (one block per grid cell)
+    """
+    df = dhru_grid_gdf.copy()
+
+    # Build lookup: grid_id → list of (dhru_id, frac)
+    cell_map: dict[int, list[tuple[int, float]]] = {}
+    for _, row in df.iterrows():
+        gid = int(row["grid_id"])
+        frac = float(row["ol_area"]) / float(row["grid_area"]) if row["grid_area"] else 0.0
+        cell_map.setdefault(gid, []).append((int(row["dhru_id"]), frac))
+
+    max_dhru = max((len(v) for v in cell_map.values()), default=0)
+
+    os.makedirs(str(table_dir), exist_ok=True)
+    out_path = os.path.join(str(table_dir), "swatmf_dhru2grid.txt")
+    with open(out_path, "w", newline="") as fh:
+        fh.write(_fmt_ints([n_grid_cells, max_dhru]))
+        for gid in range(1, n_grid_cells + 1):
+            entries = cell_map.get(gid, [])
+            fh.write(_fmt_ints([gid, len(entries)]))
+            if entries:
+                fh.write(_fmt_ints([e[0] for e in entries]))
+                fh.write(_fmt_floats([e[1] for e in entries]))
+    return out_path
+
+
+def write_swatmf_grid2dhru(
+    dhru_grid_gdf: "gpd.GeoDataFrame",
+    nrow: int,
+    ncol: int,
+    table_dir: str | os.PathLike,
+) -> str:
+    """Write ``swatmf_grid2dhru.txt`` in the format read by SWAT-MODFLOW.
+
+    For each dHRU lists the MODFLOW grid cells (as row, col pairs) it
+    intersects and the fractional area (overlap_area / dhru_area).
+
+    File format::
+
+        <n_dhrus>  <max_grids_per_dhru>
+        <dhru_id>  <n_grids>
+        <row_1>  ...  <row_n>
+        <col_1>  ...  <col_n>
+        <frac_1> ...  <frac_n>
+        ... (one block per dHRU)
+    """
+    df = dhru_grid_gdf.copy()
+
+    # Precompute row/col for each grid_id
+    def _row_col(gid: int) -> tuple[int, int]:
+        row = (int(gid) - 1) // ncol + 1
+        col = (int(gid) - 1) % ncol + 1
+        return row, col
+
+    # Build lookup: dhru_id → list of (row, col, frac)
+    dhru_map: dict[int, list[tuple[int, int, float]]] = {}
+    for _, row_data in df.iterrows():
+        did = int(row_data["dhru_id"])
+        gid = int(row_data["grid_id"])
+        frac = float(row_data["ol_area"]) / float(row_data["dhru_area"]) if row_data["dhru_area"] else 0.0
+        r, c = _row_col(gid)
+        dhru_map.setdefault(did, []).append((r, c, frac))
+
+    n_dhrus = len(dhru_map)
+    max_grids = max((len(v) for v in dhru_map.values()), default=0)
+
+    os.makedirs(str(table_dir), exist_ok=True)
+    out_path = os.path.join(str(table_dir), "swatmf_grid2dhru.txt")
+    with open(out_path, "w", newline="") as fh:
+        fh.write(_fmt_ints([n_dhrus, max_grids]))
+        for did in sorted(dhru_map.keys()):
+            entries = dhru_map[did]
+            fh.write(_fmt_ints([did, len(entries)]))
+            fh.write(_fmt_ints([e[0] for e in entries]))   # rows
+            fh.write(_fmt_ints([e[1] for e in entries]))   # cols
+            fh.write(_fmt_floats([e[2] for e in entries])) # fracs
+    return out_path
+
+
+# ---------------------------------------------------------------------------
 # High-level convenience function
 # ---------------------------------------------------------------------------
 
