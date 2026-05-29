@@ -30,5 +30,6 @@ _EXPORT_VERSION = "version 2.10.1."
 
 from .paths import Paths
 from .sim_period import parse_file_cio
+from .simulation import validate_simulation
 
-__all__ = ["Paths", "parse_file_cio"]
+__all__ = ["Paths", "parse_file_cio", "validate_simulation"]

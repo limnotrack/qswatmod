@@ -460,6 +460,87 @@ def copy_link_files(
 
 
 # ---------------------------------------------------------------------------
+# Copy MODFLOW model files to the SWAT-MODFLOW working directory
+# ---------------------------------------------------------------------------
+
+#: MODFLOW input file extensions that must be present in the working directory.
+_MF_INPUT_EXTS = (
+    ".dis", ".bas", ".nam", ".nwt", ".upw",
+    ".riv", ".rch", ".oc", ".evt", ".drn",
+)
+
+#: Extra helper files created by swatmf that must accompany the MODFLOW files.
+_MF_HELPER_FILES = ("modflow.mfn", "modflow.obs")
+
+
+def copy_modflow_files(
+    mf_folder: str | os.PathLike,
+    swatmf_folder: str | os.PathLike,
+) -> list[str]:
+    """Copy MODFLOW input files from *mf_folder* to the SWAT-MODFLOW working
+    directory, then regenerate ``modflow.mfn`` so it uses bare filenames
+    (relative to the working directory).
+
+    The SWAT-MODFLOW executable expects **all** inputs — SWAT files, MODFLOW
+    files, link tables, and ``modflow.mfn`` — to live in a single working
+    directory.  This function replicates the file-copying behaviour of the
+    QSWATMOD2 plugin's *Create linkage files* step for the MODFLOW side.
+
+    Files copied:
+
+    * All MODFLOW input packages (``*.dis``, ``*.bas``, ``*.nam``, ``*.nwt``,
+      ``*.upw``, ``*.riv``, ``*.rch``, ``*.oc``, ``*.evt``, ``*.drn`` …)
+    * ``modflow.obs`` (if present)
+    * ``modflow.mfn`` is **regenerated** in *swatmf_folder* rather than copied,
+      so that the unit-number assignments and file paths are correct for the
+      new location.
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        Folder containing the MODFLOW model files (the ``.dis``, ``.nam`` …
+        files written by flopy or the pre-built example model).
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory (``TxtInOut``).  Files are copied here.
+
+    Returns
+    -------
+    list[str]
+        Absolute paths of every file written to *swatmf_folder*.
+    """
+    from swatmf.preprocessing.modflow import create_modflow_mfn
+
+    src = str(mf_folder)
+    dst = str(swatmf_folder)
+    os.makedirs(dst, exist_ok=True)
+    copied: list[str] = []
+
+    # Copy all MODFLOW input package files.
+    for fname in os.listdir(src):
+        ext = os.path.splitext(fname)[1].lower()
+        if ext in _MF_INPUT_EXTS:
+            dst_path = shutil.copy2(os.path.join(src, fname), os.path.join(dst, fname))
+            copied.append(dst_path)
+
+    # Copy optional helper files (modflow.obs etc.) but NOT modflow.mfn —
+    # that is regenerated below with correct paths.
+    for helper in _MF_HELPER_FILES:
+        if helper == "modflow.mfn":
+            continue
+        src_path = os.path.join(src, helper)
+        if os.path.isfile(src_path):
+            dst_path = shutil.copy2(src_path, os.path.join(dst, helper))
+            copied.append(dst_path)
+
+    # Regenerate modflow.mfn in the destination so unit numbers and file
+    # references are consistent with the files now in swatmf_folder.
+    mfn_path = create_modflow_mfn(dst)
+    copied.append(mfn_path)
+
+    return copied
+
+
+# ---------------------------------------------------------------------------
 # Run SWAT-MODFLOW simulation
 # ---------------------------------------------------------------------------
 
@@ -549,11 +630,217 @@ def run_simulation(
             "Supply the exe_name parameter to specify a custom executable."
         )
 
+    # Explicitly set all three standard handles to PIPE so that Popen never
+    # tries to inherit the parent's console handles.  This prevents an
+    # OSError/WinError 6 ("The handle is invalid") that occurs when the
+    # process is launched from environments that patch or close the default
+    # handles — notably R's reticulate and some Jupyter kernels.
     proc = subprocess.Popen(
         os.path.normpath(exe_path),
         cwd=wd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
     if wait:
         proc.wait()
+        # Surface any crash information immediately after a synchronous run.
+        if proc.returncode != 0:
+            log_tail = _read_log_tail(wd)
+            stderr_text = proc.stderr.read().decode(errors="replace").strip()
+            msg_parts = [
+                f"SWAT-MODFLOW exited with return code {proc.returncode}.",
+            ]
+            if log_tail:
+                msg_parts.append(f"swatmf_log (last lines):\n{log_tail}")
+            if stderr_text:
+                msg_parts.append(f"stderr:\n{stderr_text}")
+            raise RuntimeError("\n".join(msg_parts))
 
     return proc
+
+
+# ---------------------------------------------------------------------------
+# Simulation validation
+# ---------------------------------------------------------------------------
+
+#: Mapping from SwatmfLinkConfig flag name → expected output files.
+#: Files marked with '*' use glob patterns (prefix match).
+_CFG_TO_OUTPUTS: dict[str, list[str]] = {
+    # SWAT standard outputs
+    "_always": [
+        "output.rch",
+        "output.std",
+    ],
+    # SWAT-MODFLOW coupled outputs
+    "read_mf_obs":         ["swatmf_out_MF_obs"],
+    "output_swat_dp":      ["swatmf_out_SWAT_recharge"],
+    "output_mf_recharge":  ["swatmf_out_MF_recharge"],
+    "output_channel_depth":["swatmf_out_SWAT_channel"],
+    "output_river_stage":  ["swatmf_out_MF_riverstage"],
+    "output_gwsw_grid":    ["swatmf_out_MF_gwsw"],
+    "output_gwsw_sub":     ["swatmf_out_SWAT_gwsw"],
+}
+
+
+def _read_log_tail(swatmf_folder: str, n: int = 15) -> str:
+    """Return the last *n* lines of ``swatmf_log``, or empty string."""
+    log_path = os.path.join(swatmf_folder, "swatmf_log")
+    if not os.path.isfile(log_path):
+        return ""
+    with open(log_path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.readlines()
+    return "".join(lines[-n:]).rstrip()
+
+
+def validate_simulation(
+    swatmf_folder: str | os.PathLike,
+    cfg: "SwatmfLinkConfig | None" = None,
+    *,
+    print_report: bool = True,
+) -> dict:
+    """Check simulation outputs against the configuration and the run log.
+
+    Reads ``swatmf_log`` to determine how far the executable progressed,
+    then verifies that every output file expected from the active
+    ``swatmf_link.txt`` flags actually exists and is non-empty.
+
+    Parameters
+    ----------
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory.
+    cfg : SwatmfLinkConfig, optional
+        Configuration object used for the run.  If omitted, the function
+        re-reads ``swatmf_link.txt`` from *swatmf_folder*.
+    print_report : bool, optional
+        If ``True`` (default) print a human-readable report to stdout.
+
+    Returns
+    -------
+    dict with keys:
+
+    ``"log_lines"``
+        All lines from ``swatmf_log`` as a list of strings.
+    ``"log_complete"``
+        ``True`` if the log contains the expected completion marker
+        (``"swatmf: simulation is complete"``).
+    ``"log_last"``
+        Last non-blank line of the log (useful for diagnosing crashes).
+    ``"outputs"``
+        Dict mapping each expected filename to ``"ok"``, ``"empty"``,
+        or ``"missing"``.
+    ``"all_ok"``
+        ``True`` only if the log is complete and all outputs are ``"ok"``.
+    """
+    wd = str(swatmf_folder)
+
+    # ── Read log ─────────────────────────────────────────────────────────────
+    log_path = os.path.join(wd, "swatmf_log")
+    if os.path.isfile(log_path):
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            log_lines = fh.readlines()
+    else:
+        log_lines = []
+
+    log_text = "".join(log_lines)
+    log_complete = "swatmf: simulation is complete" in log_text.lower()
+    non_blank = [l.rstrip() for l in log_lines if l.strip()]
+    log_last = non_blank[-1] if non_blank else "(log is empty)"
+
+    # ── Determine expected outputs from config ────────────────────────────────
+    if cfg is None:
+        try:
+            cfg = read_swatmf_link(wd)
+        except Exception:
+            cfg = None
+
+    expected_files: list[str] = list(_CFG_TO_OUTPUTS["_always"])
+    if cfg is not None:
+        for flag, files in _CFG_TO_OUTPUTS.items():
+            if flag == "_always":
+                continue
+            if getattr(cfg, flag, False):
+                expected_files.extend(files)
+
+    # ── Check each file ───────────────────────────────────────────────────────
+    # Files with only a header line (< 200 bytes) are treated as effectively
+    # empty — the executable writes the header before running any timesteps,
+    # so a header-only file indicates a crash during initialisation.
+    _MIN_DATA_BYTES = 200
+
+    outputs: dict[str, str] = {}
+    for fname in expected_files:
+        fpath = os.path.join(wd, fname)
+        if not os.path.isfile(fpath):
+            outputs[fname] = "missing"
+        elif os.path.getsize(fpath) < _MIN_DATA_BYTES:
+            outputs[fname] = "empty"
+        else:
+            outputs[fname] = "ok"
+
+    all_ok = log_complete and all(v == "ok" for v in outputs.values())
+
+    # ── Pre-flight: required input files ────────────────────────────────────
+    required_inputs = [
+        "swatmf_link.txt", "modflow.mfn",
+        "hru_dhru", "dhru_grid", "grid_dhru",
+        "file.cio",
+    ]
+    if cfg is not None and cfg.read_mf_obs:
+        required_inputs.append("modflow.obs")
+
+    missing_inputs: list[str] = [
+        f for f in required_inputs
+        if not os.path.isfile(os.path.join(wd, f))
+    ]
+
+    # ── Print report ─────────────────────────────────────────────────────────
+    if print_report:
+        sep = "-" * 56
+        print(sep)
+        print("SWAT-MODFLOW Simulation Validation Report")
+        print(sep)
+
+        # Log status
+        print("\n[1] Run log  (swatmf_log)")
+        if not log_lines:
+            print("    [!] swatmf_log not found -- was the model run?")
+        else:
+            complete_str = "yes" if log_complete else "NO  <- model did not finish"
+            print(f"    Complete : {complete_str}")
+            print(f"    Last line: {log_last.strip()}")
+            if not log_complete:
+                print("\n    Last 15 log lines:")
+                for line in log_lines[-15:]:
+                    print(f"      {line}", end="")
+
+        # Missing inputs
+        print("\n[2] Required input files")
+        if missing_inputs:
+            for f in missing_inputs:
+                print(f"    [!] MISSING  {f}")
+        else:
+            print("    [ok] all present")
+
+        # Output files
+        print("\n[3] Expected output files")
+        for fname, status in outputs.items():
+            icon = "[ok]" if status == "ok" else "[!] "
+            size = ""
+            fpath = os.path.join(wd, fname)
+            if os.path.isfile(fpath):
+                kb = os.path.getsize(fpath) / 1024
+                size = f"  ({kb:.1f} KB)"
+            print(f"    {icon}  {status.upper():<8}  {fname}{size}")
+
+        print(f"\n{'[ok] All checks passed.' if all_ok else '[!]  Issues found -- see above.'}")
+        print(sep)
+
+    return {
+        "log_lines":    log_lines,
+        "log_complete": log_complete,
+        "log_last":     log_last,
+        "outputs":      outputs,
+        "missing_inputs": missing_inputs,
+        "all_ok":       all_ok,
+    }
