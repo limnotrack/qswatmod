@@ -262,19 +262,23 @@ def export_hru_dhru(
     os.makedirs(str(table_dir), exist_ok=True)
     output_file = os.path.normpath(os.path.join(str(table_dir), "hru_dhru"))
 
+    # Format matches the reference files shipped with SWAT-MODFLOW:
+    #   - CRLF line endings (Windows default for the Fortran executable)
+    #   - Integer header lines with trailing tab (e.g. "27396\t\t\t\t")
+    #   - Tab-separated column header retained (Fortran reads it as a character line)
+    #   - Area values written as floats with 11 decimal places
     with open(output_file, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow([str(n_records)])
-        writer.writerow([str(max_hru_id)])
-        writer.writerow(["dhru_id dhru_area hru_id subbasin hru_area"])
+        fh.write(f"{n_records}\t\t\t\t\r\n")
+        fh.write(f"{max_hru_id}\t\t\t\t\r\n")
+        fh.write("dhru_id\tdhru_area\thru_id\tsubbasin\thru_area\r\n")
         for _, row in df.iterrows():
-            writer.writerow([
-                f"{int(row['dhru_id']):>10d}",
-                f"{int(round(row['area_f'])):>14d}",
-                f"{int(row['HRU_ID']):>7d}",
-                f"{int(row['Subbasin']):>7d}",
-                f"{int(round(row['hru_area'])):>14d}",
-            ])
+            fh.write(
+                f"{int(row['dhru_id'])}\t"
+                f"{row['area_f']:.11f}\t"
+                f"{int(row['HRU_ID'])}\t"
+                f"{int(row['Subbasin'])}\t"
+                f"{row['hru_area']:.11f}\r\n"
+            )
 
     return output_file
 
@@ -412,18 +416,17 @@ def export_dhru_grid(
     output_file = os.path.normpath(os.path.join(str(table_dir), "dhru_grid"))
 
     with open(output_file, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow([str(n_records)])
-        writer.writerow([str(total_grid_cells)])
-        writer.writerow(["grid_id grid_area dhru_id overlap_area dhru_area"])
+        fh.write(f"{n_records}\t\t\t\t\r\n")
+        fh.write(f"{total_grid_cells}\t\t\t\t\r\n")
+        fh.write("grid_id\tgrid_area\tdhru_id\toverlap_area\tdhru_area\r\n")
         for _, row in df.iterrows():
-            writer.writerow([
-                f"{int(row['grid_id']):>10d}",
-                f"{int(round(row['grid_area'])):>14d}",
-                f"{int(row['dhru_id']):>10d}",
-                f"{int(round(row['ol_area'])):>14d}",
-                f"{int(round(row['dhru_area'])):>14d}",
-            ])
+            fh.write(
+                f"{int(row['grid_id'])}\t"
+                f"{int(round(row['grid_area']))}\t"
+                f"{int(row['dhru_id'])}\t"
+                f"{row['ol_area']:.11f}\t"
+                f"{row['dhru_area']:.11f}\r\n"
+            )
 
     return output_file
 
@@ -488,20 +491,19 @@ def export_grid_dhru(
     output_file = os.path.normpath(os.path.join(str(table_dir), "grid_dhru"))
 
     with open(output_file, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow([str(n_records)])
-        writer.writerow([str(n_unique_dhru)])
-        writer.writerow([str(nrow if nrow is not None else 0)])
-        writer.writerow([str(ncol if ncol is not None else 0)])
-        writer.writerow(["grid_id grid_area dhru_id overlap_area dhru_area"])
+        fh.write(f"{n_records}\t\t\t\t\r\n")
+        fh.write(f"{n_unique_dhru}\t\t\t\t\r\n")
+        fh.write(f"{nrow if nrow is not None else 0}\t\t\t\t\r\n")
+        fh.write(f"{ncol if ncol is not None else 0}\t\t\t\t\r\n")
+        fh.write("grid_id\tgrid_area\tdhru_id\toverlap_area\tdhru_area\r\n")
         for _, row in df.iterrows():
-            writer.writerow([
-                f"{int(row['grid_id']):>10d}",
-                f"{int(round(row['grid_area'])):>14d}",
-                f"{int(row['dhru_id']):>10d}",
-                f"{int(round(row['ol_area'])):>14d}",
-                f"{int(round(row['dhru_area'])):>14d}",
-            ])
+            fh.write(
+                f"{int(row['grid_id'])}\t"
+                f"{int(round(row['grid_area']))}\t"
+                f"{int(row['dhru_id'])}\t"
+                f"{row['ol_area']:.11f}\t"
+                f"{row['dhru_area']:.11f}\r\n"
+            )
 
     return output_file
 
@@ -658,10 +660,16 @@ def generate_link_tables(
         nrow = _side
         ncol = n_ids // _side if _side > 0 else n_ids
 
-    # 5b — write table files
+    # 5b — write human-readable table files (for QA/QC and post-processing)
     hd_path = export_hru_dhru(hru_dhru_gdf, table_dir)
     dg_path = export_dhru_grid(dhru_grid_gdf, mfgrid_gdf, table_dir, grid_id_col=grid_id_col)
     gd_path = export_grid_dhru(dhru_grid_gdf, table_dir, nrow=nrow, ncol=ncol)
+
+    # 5c — write SWAT-MODFLOW executable input files (CreateSWATMF.exe format)
+    #      These are the files the SWAT-MODFLOW executable actually reads.
+    d2h_path = write_swatmf_dhru2hru(hru_dhru_gdf, table_dir)
+    d2g_path = write_swatmf_dhru2grid(dhru_grid_gdf, nrow * ncol, table_dir)
+    g2d_path = write_swatmf_grid2dhru(dhru_grid_gdf, nrow, ncol, table_dir)
 
     # optional: save intermediate GeoPackages for QA/QC
     if save_intermediate:
@@ -671,4 +679,11 @@ def generate_link_tables(
         hru_dhru_gdf.to_file(os.path.join(idir, "hru_dhru_link.gpkg"), driver="GPKG")
         dhru_grid_gdf.to_file(os.path.join(idir, "dhru_grid_link.gpkg"), driver="GPKG")
 
-    return {"hru_dhru": hd_path, "dhru_grid": dg_path, "grid_dhru": gd_path}
+    return {
+        "hru_dhru":          hd_path,
+        "dhru_grid":         dg_path,
+        "grid_dhru":         gd_path,
+        "swatmf_dhru2hru":   d2h_path,
+        "swatmf_dhru2grid":  d2g_path,
+        "swatmf_grid2dhru":  g2d_path,
+    }
