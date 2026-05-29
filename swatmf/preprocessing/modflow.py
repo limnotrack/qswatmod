@@ -513,12 +513,15 @@ def create_modflow_obs(
 
     Notes
     -----
-    File format (tab-delimited)::
+    File format matches the reference files shipped with SWAT-MODFLOW::
 
-        # modflow.obs file is created by swatmf package <version> <timestamp>
-        <N>    # Number of observation cells
-        <row>  <col>  <layer>  <grid_id>  <elev>  # Row, Col, Layer, grid_id, elevation
+        MODFLOW observation cells (number of cells, I,J,K for each cell)
+        <N>
+        <row> <col> <layer>
         ...
+
+    Only row, col, layer are written — the Fortran executable reads exactly
+    three integers per data line with list-directed I/O.
 
     Examples
     --------
@@ -535,30 +538,28 @@ def create_modflow_obs(
     df = df.sort_values("grid_id").reset_index(drop=True)
 
     if "row" not in df.columns or "col" not in df.columns:
+        n_cells = dis.n_cells
+        bad = [gid for gid in df["grid_id"] if gid < 1 or gid > n_cells]
+        if bad:
+            raise ValueError(
+                f"grid_id value(s) {bad} are out of range for this model "
+                f"({dis.nrow} rows x {dis.ncol} cols = {n_cells} cells, "
+                f"valid range 1-{n_cells}).  "
+                "Note: column names in observed-data CSVs (e.g. 'g_5699') "
+                "are well identifier numbers, not MODFLOW grid cell IDs.  "
+                "Use a spatial join of the observation-well point shapefile "
+                "with mf_grid.gpkg to find the correct grid_id for each well."
+            )
         df["row"] = [rows_all[gid - 1] for gid in df["grid_id"]]
         df["col"] = [cols_all[gid - 1] for gid in df["grid_id"]]
 
-    ts = datetime.datetime.now().strftime("- %m/%d/%y %H:%M:%S -")
     out_path = os.path.join(wd, "modflow.obs")
 
     with open(out_path, "w", newline="") as fh:
-        writer = csv.writer(fh, delimiter="\t")
-        writer.writerow(
-            [f"# modflow.obs file is created by swatmf package {_EXPORT_VERSION}{ts}"]
-        )
-        writer.writerow([f"{len(df)}", "                # Number of observation cells"])
+        fh.write("MODFLOW observation cells (number of cells, I,J,K for each cell)\n")
+        fh.write(f"{len(df)}\n")
         for _, r in df.iterrows():
-            elev = f"{float(r['top_elev']):.2f}"
-            writer.writerow(
-                [
-                    int(r["row"]),
-                    int(r["col"]),
-                    int(r["layer"]),
-                    int(r["grid_id"]),
-                    elev,
-                    "# Row, Col, Layer, grid_id, elevation ",
-                ]
-            )
+            fh.write(f"{int(r['row'])} {int(r['col'])} {int(r['layer'])}\n")
 
     return out_path
 
@@ -588,27 +589,20 @@ def read_modflow_obs(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
             if not stripped or stripped.startswith("#"):
                 continue
             parts = stripped.split()
-            # Skip the count header — it has fewer than 5 numeric-looking tokens
-            if len(parts) < 5:
-                continue
-            # The data rows have exactly 5 numeric fields (the rest is a comment)
+            # Skip text header lines and the count line (non-numeric first token)
             try:
-                row_val  = int(parts[0])
-                col_val  = int(parts[1])
-                lay_val  = int(parts[2])
-                gid_val  = int(parts[3])
-                elev_val = float(parts[4])
+                row_val = int(parts[0])
             except (ValueError, IndexError):
                 continue
-            rows.append(
-                {
-                    "row":      row_val,
-                    "col":      col_val,
-                    "layer":    lay_val,
-                    "grid_id":  gid_val,
-                    "top_elev": elev_val,
-                }
-            )
+            # Count line has exactly 1 token; data lines have 3 (row col layer)
+            if len(parts) < 3:
+                continue
+            try:
+                col_val = int(parts[1])
+                lay_val = int(parts[2])
+            except (ValueError, IndexError):
+                continue
+            rows.append({"row": row_val, "col": col_val, "layer": lay_val})
     return pd.DataFrame(rows)
 
 
@@ -857,14 +851,14 @@ def create_modflow_mfn(swatmf_folder: str | os.PathLike) -> str:
         lines.append(line + "\n")
 
     mfn_path = os.path.join(wd, "modflow.mfn")
-    with open(mfn_path, "w") as fh:
+    with open(mfn_path, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
 
     # Append to the edit log if any unit numbers were changed
     if log_entries:
         log_path = os.path.join(wd, "modflow_EditLog.txt")
         ts2 = datetime.datetime.now().strftime("[%m/%d/%y %H:%M:%S]")
-        with open(log_path, "a") as fh:
+        with open(log_path, "a", encoding="utf-8") as fh:
             for entry in log_entries:
                 fh.write(f"{ts2} -> {entry}\n")
 
@@ -916,13 +910,13 @@ def modify_modflow_oc(swatmf_folder: str | os.PathLike) -> str:
                 )
             lines.append(line)
 
-    with open(oc_path, "w") as fh:
+    with open(oc_path, "w", encoding="utf-8") as fh:
         fh.writelines(lines)
 
     if log_entries:
         log_path = os.path.join(wd, "modflow_EditLog.txt")
         ts2 = datetime.datetime.now().strftime("[%m/%d/%y %H:%M:%S]")
-        with open(log_path, "a") as fh:
+        with open(log_path, "a", encoding="utf-8") as fh:
             for entry in log_entries:
                 fh.write(f"{ts2} -> {entry}\n")
 
