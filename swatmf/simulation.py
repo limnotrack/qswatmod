@@ -497,6 +497,59 @@ _MF_INPUT_EXTS = (
 _MF_HELPER_FILES = ("modflow.mfn", "modflow.obs")
 
 
+def write_swatmf_river2grid(
+    river_grid_df: "pd.DataFrame",
+    swatmf_folder: str | os.PathLike,
+    *,
+    layer: int = 1,
+) -> str:
+    """Write ``swatmf_river2grid.txt`` in the format read by SWAT-MODFLOW.
+
+    Parameters
+    ----------
+    river_grid_df : DataFrame
+        Output of :func:`swatmf.preprocessing.linking.generate_river_grid`.
+        Must have columns ``grid_id`` (int), ``subbasin`` (int),
+        ``rgrid_len`` (float).
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory (TxtInOut).
+    layer : int, optional
+        MODFLOW layer number for all river cells.  Default 1.
+
+    Returns
+    -------
+    str
+        Absolute path to the written file.
+    """
+    df = river_grid_df.copy()
+    df["grid_id"]  = df["grid_id"].astype(int)
+    df["subbasin"] = df["subbasin"].astype(int)
+
+    # Deduplicate to one entry per grid cell: keep the subbasin with the
+    # longest river segment in that cell (matches CreateSWATMF.exe behaviour —
+    # the executable reads one RIV-package entry per grid cell, so
+    # swatmf_river2grid.txt must have exactly one row per unique grid_id).
+    df = (
+        df.sort_values("rgrid_len", ascending=False)
+          .drop_duplicates(subset="grid_id", keep="first")
+          .sort_values("grid_id")
+          .reset_index(drop=True)
+    )
+
+    out_path = os.path.join(str(swatmf_folder), "swatmf_river2grid.txt")
+    with open(out_path, "wb") as fh:
+        fh.write(f"{len(df):13d}\r\n".encode())
+        for i, row in df.iterrows():
+            river_id = int(i) + 1
+            fh.write(
+                f"{river_id:13d}{int(row['grid_id']):13d}"
+                f"{int(row['subbasin']):13d}\r\n".encode()
+            )
+            fh.write(f"{layer:13d}\r\n".encode())
+            fh.write(f"{float(row['rgrid_len']):13.5f}\r\n".encode())
+    return out_path
+
+
 def copy_modflow_files(
     mf_folder: str | os.PathLike,
     swatmf_folder: str | os.PathLike,
@@ -654,25 +707,31 @@ def run_simulation(
             "Supply the exe_name parameter to specify a custom executable."
         )
 
-    # Explicitly set all three standard handles to PIPE so that Popen never
-    # tries to inherit the parent's console handles.  This prevents an
-    # OSError/WinError 6 ("The handle is invalid") that occurs when the
-    # process is launched from environments that patch or close the default
-    # handles — notably R's reticulate and some Jupyter kernels.
+    # Explicitly redirect stdin to DEVNULL to prevent the process from inheriting
+    # invalid console handles (fixes OSError/WinError 6 in R's reticulate).
+    #
+    # stdout is redirected to DEVNULL (discarded): the executable produces no
+    # meaningful stdout and the pipe buffer would deadlock if we used PIPE with
+    # proc.wait() on a long run.
+    #
+    # stderr is captured via communicate() which drains the pipe continuously
+    # to prevent the same buffer-full deadlock.
     proc = subprocess.Popen(
         os.path.normpath(exe_path),
         cwd=wd,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,   # discard — avoids pipe-buffer deadlock
+        stderr=subprocess.PIPE,      # capture for error reporting
     )
+
     if wait:
-        proc.wait()
-        # Surface any crash information immediately after a synchronous run.
+        # communicate() drains stderr while waiting — safe for long runs.
+        # For progress output use run_simulation_monitored() instead.
+        _, stderr_bytes = proc.communicate()
         if proc.returncode != 0:
-            log_tail = _read_log_tail(wd)
-            stderr_text = proc.stderr.read().decode(errors="replace").strip()
-            msg_parts = [
+            log_tail    = _read_log_tail(wd)
+            stderr_text = (stderr_bytes or b"").decode(errors="replace").strip()
+            msg_parts   = [
                 f"SWAT-MODFLOW exited with return code {proc.returncode}.",
             ]
             if log_tail:
@@ -680,7 +739,137 @@ def run_simulation(
             if stderr_text:
                 msg_parts.append(f"stderr:\n{stderr_text}")
             raise RuntimeError("\n".join(msg_parts))
+        # Store captured stderr on the object so callers can inspect it.
+        proc._stderr_output = (stderr_bytes or b"").decode(errors="replace")
 
+    return proc
+
+
+# ---------------------------------------------------------------------------
+# Monitored run — prints swatmf_log lines as they are written
+# ---------------------------------------------------------------------------
+
+def run_simulation_monitored(
+    swatmf_folder: str | os.PathLike,
+    exe_name: str | None = None,
+    *,
+    poll_interval: float = 2.0,
+) -> subprocess.Popen:
+    """Launch SWAT-MODFLOW and stream ``swatmf_log`` to stdout in real time.
+
+    Unlike :func:`run_simulation` (which blocks silently), this function
+    prints each new line written to ``swatmf_log`` as the executable runs,
+    then prints a dot every *poll_interval* seconds while the time-stepping
+    loop is active (the executable only writes to the log during init).
+
+    Parameters
+    ----------
+    swatmf_folder : str or path-like
+        SWAT-MODFLOW working directory.
+    exe_name : str, optional
+        Executable name or path.  Auto-detected when omitted.
+    poll_interval : float, optional
+        Seconds between log-file checks.  Default 2.
+
+    Returns
+    -------
+    subprocess.Popen
+        Completed process object (``returncode`` is set).
+
+    Raises
+    ------
+    RuntimeError
+        If the executable exits with a non-zero return code.
+    """
+    import time
+    import threading
+
+    wd = str(swatmf_folder)
+
+    # Launch (non-blocking)
+    proc = run_simulation(wd, exe_name=exe_name, wait=False)
+
+    log_path    = os.path.join(wd, "swatmf_log")
+    seen_bytes  = 0
+    init_done   = False
+    dot_count   = 0
+    _COLS       = 60   # dots per line before wrapping
+
+    print("Running SWAT-MODFLOW  (log output below — dots = time-stepping)")
+    print("-" * 60)
+
+    # Drain stderr in a background thread so it never blocks
+    stderr_buf: list[bytes] = []
+    def _drain() -> None:
+        if proc.stderr:
+            stderr_buf.append(proc.stderr.read())
+    t = threading.Thread(target=_drain, daemon=True)
+    t.start()
+
+    try:
+        while proc.poll() is None:
+            # Read any new log lines
+            if os.path.isfile(log_path):
+                with open(log_path, "rb") as fh:
+                    fh.seek(seen_bytes)
+                    chunk = fh.read()
+                if chunk:
+                    seen_bytes += len(chunk)
+                    for line in chunk.decode(errors="replace").splitlines():
+                        line = line.strip()
+                        if line:
+                            if dot_count:
+                                print()   # end the dots line
+                                dot_count = 0
+                            print(f"  {line}")
+                    # After init the log goes quiet — switch to dot mode
+                    if "initialization finished" in chunk.decode(errors="replace"):
+                        init_done = True
+
+            if init_done:
+                print(".", end="", flush=True)
+                dot_count += 1
+                if dot_count >= _COLS:
+                    print()
+                    dot_count = 0
+
+            time.sleep(poll_interval)
+
+    except KeyboardInterrupt:
+        proc.terminate()
+        print("\n[interrupted]")
+        return proc
+
+    t.join(timeout=5)
+
+    # Print any remaining log content
+    if os.path.isfile(log_path):
+        with open(log_path, "rb") as fh:
+            fh.seek(seen_bytes)
+            remainder = fh.read()
+        if remainder:
+            if dot_count:
+                print()
+            for line in remainder.decode(errors="replace").splitlines():
+                if line.strip():
+                    print(f"  {line.strip()}")
+
+    if dot_count:
+        print()
+
+    print("-" * 60)
+
+    if proc.returncode != 0:
+        log_tail    = _read_log_tail(wd)
+        stderr_text = (b"".join(stderr_buf)).decode(errors="replace").strip()
+        msg_parts   = [f"SWAT-MODFLOW exited with return code {proc.returncode}."]
+        if log_tail:
+            msg_parts.append(f"swatmf_log (last lines):\n{log_tail}")
+        if stderr_text:
+            msg_parts.append(f"stderr:\n{stderr_text}")
+        raise RuntimeError("\n".join(msg_parts))
+
+    print(f"Simulation complete.  Return code: {proc.returncode}")
     return proc
 
 

@@ -671,6 +671,114 @@ def write_swatmf_grid2dhru(
 
 
 # ---------------------------------------------------------------------------
+# River-grid table (stream network × MODFLOW grid × subbasins)
+# ---------------------------------------------------------------------------
+
+def generate_river_grid(
+    riv_path: str | os.PathLike,
+    mfgrid_path: str | os.PathLike,
+    sub_path: str | os.PathLike,
+    table_dir: str | os.PathLike,
+    *,
+    grid_id_col: str = "grid_id",
+    sub_id_col: str | None = None,
+    min_length_m: float = 0.1,
+) -> "gpd.GeoDataFrame":
+    """Intersect the SWAT stream network with the MODFLOW grid and subbasins.
+
+    Produces the ``river_grid`` link table used by ``write_swatmf_river2grid``
+    to build ``swatmf_river2grid.txt``.
+
+    Parameters
+    ----------
+    riv_path : str or path-like
+        Stream network shapefile (lines, e.g. ``riv1.shp``).
+    mfgrid_path : str or path-like
+        MODFLOW grid shapefile / GeoPackage (e.g. ``mf_grid.gpkg``).
+    sub_path : str or path-like
+        SWAT subbasin shapefile (e.g. ``sub1.shp``).
+    table_dir : str or path-like
+        Destination directory for the ``river_grid`` table file.
+    grid_id_col : str, optional
+        Column in *mfgrid_path* holding the cell ID.  Default ``"grid_id"``.
+    sub_id_col : str, optional
+        Column in *sub_path* holding the subbasin integer ID.  Auto-detected
+        from common names (``Subbasin``, ``SUB``, ``Id``, …) if omitted.
+    min_length_m : float, optional
+        Drop river segments shorter than this [map units, usually metres].
+        Default 0.1.
+
+    Returns
+    -------
+    GeoDataFrame
+        Columns: ``grid_id`` (int), ``subbasin`` (int), ``rgrid_len`` (float).
+    """
+    riv_gdf  = gpd.read_file(str(riv_path))
+    grid_gdf = gpd.read_file(str(mfgrid_path))
+    sub_gdf  = gpd.read_file(str(sub_path))
+
+    # Reproject all layers to the grid CRS
+    crs = grid_gdf.crs
+    riv_gdf = riv_gdf.to_crs(crs)
+    sub_gdf = sub_gdf.to_crs(crs)
+
+    # Auto-detect subbasin ID column
+    if sub_id_col is None:
+        for c in ("Subbasin", "SUBBASIN", "subbasin", "SUB", "Id", "ID", "FID"):
+            if c in sub_gdf.columns:
+                sub_id_col = c
+                break
+    if sub_id_col is None:
+        raise ValueError(
+            "Could not auto-detect subbasin ID column.  "
+            "Pass sub_id_col= explicitly."
+        )
+
+    # ── Step 1: streams × MODFLOW grid ────────────────────────────────────────
+    riv_x_grid = gpd.overlay(
+        riv_gdf[["geometry"]],
+        grid_gdf[[grid_id_col, "geometry"]],
+        how="intersection",
+        keep_geom_type=True,
+    )
+    riv_x_grid["_len"] = riv_x_grid.geometry.length
+    riv_x_grid = riv_x_grid[riv_x_grid["_len"] >= min_length_m].copy()
+
+    # ── Step 2: result × subbasins ────────────────────────────────────────────
+    riv_x_sub = gpd.overlay(
+        riv_x_grid[[grid_id_col, "geometry"]],
+        sub_gdf[[sub_id_col, "geometry"]],
+        how="intersection",
+        keep_geom_type=True,
+    )
+    riv_x_sub["rgrid_len"] = riv_x_sub.geometry.length
+    riv_x_sub = riv_x_sub[riv_x_sub["rgrid_len"] >= min_length_m].copy()
+
+    # ── Step 3: aggregate by (grid_id, subbasin) ──────────────────────────────
+    df = (
+        riv_x_sub
+        .groupby([grid_id_col, sub_id_col])["rgrid_len"]
+        .sum()
+        .reset_index()
+        .rename(columns={grid_id_col: "grid_id", sub_id_col: "subbasin"})
+    )
+    df["grid_id"]  = df["grid_id"].astype(int)
+    df["subbasin"] = df["subbasin"].astype(int)
+    df = df.sort_values(["grid_id", "subbasin"]).reset_index(drop=True)
+
+    # ── Write the human-readable river_grid table ──────────────────────────────
+    os.makedirs(str(table_dir), exist_ok=True)
+    out_file = os.path.join(str(table_dir), "river_grid")
+    with open(out_file, "w", newline="") as fh:
+        fh.write(f"{len(df)}\t\t\r\n")
+        fh.write("grid_id\tsubbasin\trgrid_len\r\n")
+        for _, row in df.iterrows():
+            fh.write(f"{int(row['grid_id'])}\t{int(row['subbasin'])}\t{row['rgrid_len']:.11f}\r\n")
+
+    return df[["grid_id", "subbasin", "rgrid_len"]]
+
+
+# ---------------------------------------------------------------------------
 # High-level convenience function
 # ---------------------------------------------------------------------------
 

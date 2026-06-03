@@ -26,6 +26,24 @@ from ..metrics import all_metrics
 def read_mf_obs(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
     """Read ``modflow.obs`` and return a DataFrame of observation cell metadata.
 
+    Supports both the **new** 3-column format written by this package::
+
+        MODFLOW observation cells (number of cells, I,J,K for each cell)
+        <N>
+        <row> <col> <layer>
+        ...
+
+    and the **legacy** 5-column format::
+
+        # comment
+        <N>  # comment
+        <row> <col> <layer> <grid_id> <elev>
+        ...
+
+    In the new format ``grid_id`` is computed as ``(row-1)*ncol + col``
+    using the ``.dis`` file found in *swatmf_folder*, and ``mf_elev`` is
+    read from the TOP array in that same ``.dis`` file.
+
     Parameters
     ----------
     swatmf_folder : str or path-like
@@ -34,19 +52,138 @@ def read_mf_obs(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
     Returns
     -------
     pd.DataFrame
-        Index: ``grid_id`` (int); column: ``mf_elev`` — land-surface
-        elevation at the observation point.
+        Index: ``grid_id`` (int).
+        Columns: ``row``, ``col``, ``layer``, ``mf_elev``.
     """
-    path = os.path.join(str(swatmf_folder), "modflow.obs")
-    df = pd.read_csv(
-        path,
-        sep=r"\s+",
-        skiprows=2,
-        usecols=[3, 4],
-        index_col=0,
-        names=["grid_id", "mf_elev"],
-    )
+    wd = str(swatmf_folder)
+    path = os.path.join(wd, "modflow.obs")
+
+    # Parse the file manually to handle both old and new formats
+    rows = []
+    with open(path) as fh:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            parts = stripped.split()
+            try:
+                row_val = int(parts[0])
+            except ValueError:
+                continue                     # text header line
+            if len(parts) < 3:
+                continue                     # count-only line
+            try:
+                col_val = int(parts[1])
+                lay_val = int(parts[2])
+            except (ValueError, IndexError):
+                continue
+            entry = {"row": row_val, "col": col_val, "layer": lay_val}
+            # Legacy format: grid_id and elevation in columns 3-4
+            if len(parts) >= 5:
+                try:
+                    entry["grid_id"] = int(parts[3])
+                    entry["mf_elev"] = float(parts[4])
+                except (ValueError, IndexError):
+                    pass
+            rows.append(entry)
+
+    df = pd.DataFrame(rows)
+
+    # If grid_id was not in the file, derive it from the .dis file
+    if "grid_id" not in df.columns:
+        ncol = _read_ncol(wd)
+        df["grid_id"] = (df["row"] - 1) * ncol + df["col"]
+
+    # If elevation was not in the file, read it from the TOP array
+    if "mf_elev" not in df.columns:
+        top_flat = _read_dis_top(wd)
+        if top_flat is not None:
+            df["mf_elev"] = df["grid_id"].apply(
+                lambda gid: top_flat[int(gid) - 1] if 0 < int(gid) <= len(top_flat) else float("nan")
+            )
+        else:
+            df["mf_elev"] = float("nan")
+
+    df = df.set_index("grid_id")
     return df
+
+
+def _read_ncol(swatmf_folder: str) -> int:
+    """Read NCOL from the first ``.dis`` file found in *swatmf_folder*."""
+    import glob as _glob
+    dis_files = _glob.glob(os.path.join(swatmf_folder, "*.dis"))
+    if not dis_files:
+        raise FileNotFoundError(f"No .dis file found in {swatmf_folder!r}")
+    with open(dis_files[0]) as fh:
+        for line in fh:
+            s = line.strip()
+            if s and not s.startswith("#"):
+                parts = s.split()
+                return int(parts[2])   # nlay nrow ncol …
+    raise ValueError("Could not parse NCOL from .dis file")
+
+
+def _read_dis_top(swatmf_folder: str) -> Optional[list]:
+    """Return the TOP array from the ``.dis`` file as a flat list, or None.
+
+    Handles Flopy-generated DIS files that use ``CONSTANT`` and ``INTERNAL``
+    array control records (with optional format strings and comment tokens).
+    """
+    import glob as _glob
+    dis_files = _glob.glob(os.path.join(swatmf_folder, "*.dis"))
+    if not dis_files:
+        return None
+    try:
+        with open(dis_files[0]) as fh:
+            lines = [l.rstrip() for l in fh]
+
+        # Strip comment lines
+        data_lines = [l for l in lines if not l.lstrip().startswith("#")]
+
+        # ── Parse main header (first non-comment line) ─────────────────────
+        hdr = data_lines[0].split()
+        nlay, nrow, ncol = int(hdr[0]), int(hdr[1]), int(hdr[2])
+        li = 1   # next line index
+
+        # ── Skip LAYCBD (nlay integers on one or more lines) ───────────────
+        laycbd_read = 0
+        while laycbd_read < nlay:
+            vals = data_lines[li].split()
+            laycbd_read += len(vals)
+            li += 1
+
+        # ── Helper: read one MODFLOW 2D array block ────────────────────────
+        def read_array(n_vals: int):
+            nonlocal li
+            ctrl = data_lines[li].split()
+            li += 1
+            keyword = ctrl[0].upper()
+            if keyword == "CONSTANT":
+                return [float(ctrl[1])] * n_vals
+            if keyword == "INTERNAL":
+                # Read n_vals float tokens from following lines
+                vals: list[float] = []
+                while len(vals) < n_vals:
+                    row_tokens = data_lines[li].split()
+                    li += 1
+                    vals.extend(float(t) for t in row_tokens)
+                return vals[:n_vals]
+            # Fallback: treat control line itself as data (old-style)
+            vals = [float(t) for t in ctrl]
+            while len(vals) < n_vals:
+                vals.extend(float(t) for t in data_lines[li].split())
+                li += 1
+            return vals[:n_vals]
+
+        # ── DELR (ncol) ────────────────────────────────────────────────────
+        read_array(ncol)
+        # ── DELC (nrow) ────────────────────────────────────────────────────
+        read_array(nrow)
+        # ── TOP (nrow × ncol) — this is what we want ──────────────────────
+        top = read_array(nrow * ncol)
+        return top
+    except Exception:
+        return None
 
 
 def read_swatmf_out_MF_obs(swatmf_folder: str | os.PathLike) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -163,7 +300,7 @@ def get_groundwater(
 
     col = str(grid_id)
     if depth_to_water:
-        elev = float(mf_obs.loc[int(grid_id)])
+        elev = float(mf_obs.loc[int(grid_id), "mf_elev"])
         result = (df[col] - elev).rename(col)
     else:
         result = df[col]

@@ -62,6 +62,7 @@ clarity.
 
 ```{python}
 import os
+import matplotlib.pyplot as plt
 
 # ── PROJ conflict fix ───────────────────────────────────────────────────────
 # TauDEM ships an older PROJ database that can shadow rasterio's bundled one.
@@ -803,35 +804,32 @@ launch the SWAT-MODFLOW executable.  The function searches the working
 directory for a recognised executable name and starts it with `cwd` set to
 the working directory so all relative file paths resolve correctly.
 
-The executable's stdout and stderr are captured via `subprocess.PIPE` so the
-process launches cleanly in any host environment (Jupyter, R reticulate,
-terminal, etc.).  Use `proc.stdout` / `proc.stderr` to read the output.
+`run_simulation_monitored` streams `swatmf_log` to the console as the
+executable writes it (init messages appear immediately; a dot is printed
+every 2 s during the time-stepping loop so you can see it is not hung).
 
 ```{python}
-from swatmf.simulation import run_simulation, validate_simulation
+from swatmf.simulation import run_simulation_monitored, validate_simulation
 
-# Run synchronously — blocks until the simulation finishes.
-# If the executable exits with a non-zero return code, run_simulation raises
-# a RuntimeError that includes the tail of swatmf_log and stderr output.
+# Runs synchronously with live log output.
+# Raises RuntimeError on non-zero exit code with the full log tail + stderr.
 try:
-    proc = run_simulation(
+    proc = run_simulation_monitored(
         swatmf_folder = wd,
         # exe_name = "SWAT-MODFLOW3.exe",  # uncomment to override auto-detection
-        wait = True,
+        poll_interval = 2.0,               # seconds between log checks
     )
-    print("Simulation finished.  Return code:", proc.returncode)
 except RuntimeError as e:
     print("Simulation crashed:\n", e)
 ```
 
-To run in the background (non-blocking):
+To run silently in the background (non-blocking) and check on it manually:
 
 ```{python}
+# from swatmf.simulation import run_simulation
 # proc = run_simulation(wd, wait=False)
-# import time
-# while proc.poll() is None:
-#     time.sleep(5)
-#     print("Simulation still running …")
+# # … do other work …
+# proc.wait()
 # print("Done — return code:", proc.returncode)
 ```
 
@@ -926,6 +924,7 @@ fig, ax = plot_streamflow(
     obd_col=OBD_COL,
     timescale=TIMESCALE,
 )
+plt.show()
 ```
 
 ### 4.2  Performance metrics
@@ -1026,6 +1025,7 @@ fig, ax = plot_groundwater(
     timescale=GW_TIMESCALE,
     depth_to_water=DEPTH_TO_WATER,
 )
+plt.show()
 ```
 
 ### 5.2  Performance metrics
@@ -1104,6 +1104,7 @@ rch_df.iloc[:5, :5]
 
 ```{python}
 fig, ax = plot_recharge_timeseries(rch_df)
+plt.show()
 ```
 
 ### 6.2  Average monthly recharge
@@ -1112,6 +1113,7 @@ fig, ax = plot_recharge_timeseries(rch_df)
 if RCH_TIMESCALE == "Monthly":
     avg_rch = average_monthly_recharge(rch_df)
     fig, ax = plot_avg_monthly_recharge(avg_rch)
+    plt.show()
 ```
 
 ---
@@ -1122,8 +1124,12 @@ GW-SW exchange fluxes are read from `swatmf_out_MF_gwsw*`.  Positive values
 indicate groundwater discharge to the stream; negative values indicate stream
 losses to the aquifer.
 
-> **Note:** `N_RIV_CELLS` is the number of MODFLOW river cells.  This can be
-> read from the RIV package file or derived from the `river_grid` shapefile.
+> **Note:** GW-SW exchange coupling requires a `river_grid` table from GIS
+> preprocessing (intersecting the stream network with the MODFLOW grid and
+> subbasin polygons) to build `swatmf_river2grid.txt`.  Without it the output
+> file contains 0 river cells per time step and `gwsw_df` will be empty.
+> The pre-built mb_500 model uses a zero-record placeholder — GWSW output
+> is not available for this example.
 
 ```{python}
 from swatmf.outputs.gwsw import (
@@ -1133,18 +1139,14 @@ from swatmf.outputs.gwsw import (
 )
 
 # ── User inputs ─────────────────────────────────────────────────────────────
-# N_RIV_CELLS must equal the number of MODFLOW river-package cells.
-# Derive it from the parsed .riv file (Option 1 from Section 2.4), or count
-# rows in your river_grid shapefile if using Options 2/3.
-# Note: riv_df was parsed in Section 2.4 using parse_riv_file(mf_wd).
-N_RIV_CELLS    = len(riv_df)   # number of river cells in the .riv package
+# get_gwsw() auto-detects the actual river-cell count from the output file,
+# so any value of N_RIV_CELLS is safe (a warning is issued if it differs).
+N_RIV_CELLS    = len(riv_df)   # from parsed .riv file in Section 2.4
 GWSW_TIMESCALE = "Daily"       # 'Daily', 'Monthly', or 'Annual'
 # ────────────────────────────────────────────────────────────────────────────
 
-print(f"River cells: {N_RIV_CELLS}")
 gwsw_dates = read_gwsw_dates(wd, timescale=GWSW_TIMESCALE, start_date=start_mdy)
 print(f"Available {GWSW_TIMESCALE.lower()} GW-SW steps: {len(gwsw_dates)}")
-print(f"  First: {gwsw_dates[0]}   Last: {gwsw_dates[-1]}")
 ```
 
 ```{python}
@@ -1155,21 +1157,31 @@ gwsw_df = get_gwsw(
     timescale=GWSW_TIMESCALE,
 )
 
-print(gwsw_df.shape)  # (n_dates, n_river_cells)
-gwsw_df.head()
+if gwsw_df.empty:
+    print("No GW-SW data available (0 river cells in output).")
+    print("Provide a 'river_grid' GIS table to enable GW-SW coupling.")
+else:
+    print(gwsw_df.shape)  # (n_dates, n_river_cells)
+    display(gwsw_df.head())
 ```
 
 ### 7.1  Basin total GW-SW exchange
 
 ```{python}
-fig, ax = plot_gwsw_timeseries(gwsw_df, timescale=GWSW_TIMESCALE)
+if not gwsw_df.empty:
+    fig, ax = plot_gwsw_timeseries(gwsw_df, timescale=GWSW_TIMESCALE)
+else:
+    print("Skipped — no GW-SW data.")
 ```
 
 ### 7.2  Export
 
 ```{python}
-fpath = export_gwsw(gwsw_df, out, timescale=GWSW_TIMESCALE)
-print("Exported to:", fpath)
+if not gwsw_df.empty:
+    fpath = export_gwsw(gwsw_df, out, timescale=GWSW_TIMESCALE)
+    print("Exported to:", fpath)
+else:
+    print("Skipped — no GW-SW data.")
 ```
 
 ---

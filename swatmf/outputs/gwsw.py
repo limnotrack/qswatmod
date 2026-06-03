@@ -92,6 +92,22 @@ def _find_block_start(
     raise ValueError(f"Could not find block #{date_idx} for prefix {prefix!r}")
 
 
+def _detect_n_riv_cells(data: list[list[str]], prefix: str) -> int:
+    """Count actual data rows between the first two time-step headers.
+
+    Returns 0 if the file has no data rows (e.g. swatmf_river2grid.txt
+    was written with 0 river cells).
+    """
+    markers = [i for i, row in enumerate(data) if row and row[0] == prefix]
+    if len(markers) < 2:
+        # Only one block — count rows until end of list
+        start = markers[0] + 1 if markers else 0
+        return sum(1 for row in data[start:] if row and row[0] != prefix)
+    start = markers[0] + 1
+    end   = markers[1]
+    return end - start
+
+
 # ---------------------------------------------------------------------------
 # Public: read GW-SW exchange dates
 # ---------------------------------------------------------------------------
@@ -188,6 +204,22 @@ def get_gwsw(
         raise ValueError(
             f"timescale must be 'Daily', 'Monthly', or 'Annual'; got {timescale!r}"
         )
+
+    # Auto-detect actual cell count from the file; warn if it differs from the
+    # caller-supplied n_riv_cells (which may be 0 when swatmf_river2grid.txt
+    # was written with no cells).
+    actual_n = _detect_n_riv_cells(data, prefix)
+    if actual_n != n_riv_cells:
+        import warnings
+        warnings.warn(
+            f"get_gwsw: n_riv_cells={n_riv_cells} but the output file contains "
+            f"{actual_n} river cells per time step.  Using {actual_n}.",
+            stacklevel=2,
+        )
+        n_riv_cells = actual_n
+
+    if n_riv_cells == 0:
+        return pd.DataFrame(index=date_labels, dtype=float)
 
     si = date_labels.index(sdate) if sdate else 0
     ei = date_labels.index(edate) + 1 if edate else len(date_labels)
