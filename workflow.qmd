@@ -33,14 +33,15 @@ The sections below follow the same tabs as the QSWATMOD2 plugin:
 | # | Section | Plugin tab |
 |---|---------|-----------|
 | 1 | Setup — paths and simulation period | *(common)* |
-| 2 | **Pre-Processing** — SWAT inputs, MODFLOW options, river connections, linking | Pre-Processing |
+| 2 | **Pre-Processing** — SWAT inputs, MODFLOW options, river connections, linking, RT3D | Pre-Processing |
 | 3 | **Simulation** — pumping, drain cells, groundwater delay | Simulation |
 | 4 | Streamflow | Post-Processing |
 | 5 | Groundwater Levels | Post-Processing |
 | 6 | MODFLOW Recharge | Post-Processing |
 | 7 | GW–SW Exchange | Post-Processing |
 | 8 | Water Balance | Post-Processing |
-| 9 | Performance Metrics Summary | *(summary)* |
+| 9 | **RT3D** — Reactive Transport (NO₃, P) | Post-Processing |
+| 10 | Performance Metrics Summary | *(summary)* |
 
 ---
 
@@ -711,6 +712,100 @@ for fname in required:
     print(f"  {fname:<25} {status}")
 ```
 
+### 2.7  RT3D — Reactive Transport Pre-Processing (optional)
+
+If you plan to simulate nitrogen and phosphorus transport in the groundwater
+system, create the RT3D input files here.  RT3D requires the MODFLOW model to
+be already set up (grid dimensions are read from the `.dis` file).
+
+The `swatmf.preprocessing.rt3d` module writes all six RT3D package files plus
+the master `rt3d_filenames` list:
+
+| File | Purpose |
+|------|---------|
+| `.btn` | Basic Transport — species, porosity, ICBUND, initial concentrations, output times |
+| `.dsp` | Dispersion — longitudinal dispersivity and transverse/vertical ratios |
+| `.rct` | Reaction — denitrification kinetics (IREACT=10), sorption, bulk density |
+| `.gcg` | Implicit GCG solver settings |
+| `.adv` | Advection method selection |
+| `.ssm` | Source/Sink Mixing (minimal — concentrations are passed at runtime via SMRT) |
+| `rt3d_filenames` | Maps package codes to file paths for the executable |
+
+```{python}
+from swatmf.preprocessing.rt3d import RT3DConfig, write_rt3d_model
+from swatmf.preprocessing.modflow import parse_dis_file
+
+# ── Read grid dimensions from the existing MODFLOW .dis file ────────────────
+import glob as _glob
+
+dis_files = _glob.glob(os.path.join(wd, "*.dis"))
+if dis_files:
+    dis_info = parse_dis_file(dis_files[0])
+    NROW = dis_info["nrow"]
+    NCOL = dis_info["ncol"]
+    print(f"Grid: {NROW} rows × {NCOL} cols (from {os.path.basename(dis_files[0])})")
+else:
+    # Fallback: set manually
+    NROW = 46
+    NCOL = 81
+    print(f"Grid: {NROW} rows × {NCOL} cols (set manually)")
+```
+
+```{python}
+# ── Configure RT3D parameters ───────────────────────────────────────────────
+rt3d_cfg = RT3DConfig(
+    model_name   = "rt3d_model",
+    nrow         = NROW,
+    ncol         = NCOL,
+    nlay         = 1,
+
+    # Transport properties
+    porosity     = 0.30,       # scalar: applied to all active cells
+
+    # Initial concentrations [mg/L]
+    initial_conc_no3 = 0.5,    # uniform background NO₃
+    initial_conc_p   = 0.01,   # uniform background P
+
+    # Dispersion
+    longitudinal_dispersivity = 10.0,   # [m]
+    ratio_h_to_l              = 0.1,
+    ratio_v_to_l              = 0.01,
+    effective_molecular_diffusion = 0.0,
+
+    # Reaction
+    bulk_density       = 1.50,   # [g/cm³]
+    sorption_no3       = 0.0,    # no sorption for NO₃
+    sorption_p         = 0.0,    # no sorption for P
+    k_denitrification  = 0.01,   # first-order rate [1/day]
+    k_half_saturation  = 10.0,   # Monod half-saturation [mg/L]
+
+    # Observation cells (optional) — use same cells as MODFLOW obs
+    # obs_cells = pd.read_csv(os.path.join(wd, "modflow.obs"), ...)
+)
+
+# ── Write output times (e.g. daily for 1 year) ─────────────────────────────
+# Adjust to match your simulation length
+output_times = list(range(1, 366))
+```
+
+```{python}
+# ── Write all RT3D files ────────────────────────────────────────────────────
+rt3d_files = write_rt3d_model(wd, rt3d_cfg, output_times=output_times)
+
+print("RT3D files written:")
+for pkg, path in rt3d_files.items():
+    print(f"  {pkg:<12} → {os.path.basename(path)}")
+```
+
+::: {.callout-note}
+Remember to enable RT3D in the simulation flags (Section 3.1):
+```python
+cfg.rt3d_active = True
+```
+Without this flag, the SWAT-MODFLOW executable will ignore the RT3D input
+files even if they exist.
+:::
+
 ---
 
 ## 3  Simulation Tab
@@ -751,6 +846,10 @@ cfg.output_river_stage   = True
 cfg.output_gwsw_grid     = True
 cfg.output_gwsw_sub      = True
 cfg.output_print_avg     = True
+
+# RT3D reactive transport (nitrogen & phosphorus in groundwater)
+# Enable only if RT3D input files were created in Section 2.7
+cfg.rt3d_active = False         # True → activate RT3D N/P transport
 
 # Output frequency: write results every N days (1 = every day)
 cfg.output_step = 1
@@ -1226,7 +1325,128 @@ print("Exported to:", fpath)
 
 ---
 
-## 9  Performance Metrics Summary
+## 9  RT3D — Reactive Transport Post-Processing
+
+This section reads and visualises the RT3D concentration outputs produced by
+the SWAT-MODFLOW-RT3D coupled model.  It is only relevant when
+`cfg.rt3d_active = True` was set in Section 3.
+
+### 9.1  Read concentration grids
+
+```{python}
+from swatmf.outputs.rt3d import read_rt3d_conc, plot_conc_map
+
+# Read monthly NO₃ concentrations
+try:
+    no3_monthly = read_rt3d_conc(
+        wd,
+        species="no3",
+        freq="monthly",
+        start_date=sim_period["start_date"].strftime("%Y-%m-%d"),
+    )
+    print(f"NO₃ monthly: {len(no3_monthly)} time steps loaded")
+    # Show grid shape of first time step
+    first_key = list(no3_monthly.keys())[0]
+    print(f"  Grid shape: {no3_monthly[first_key].shape}")
+except FileNotFoundError as e:
+    no3_monthly = None
+    print(f"⚠ {e}")
+```
+
+```{python}
+# Read monthly P concentrations
+try:
+    p_monthly = read_rt3d_conc(
+        wd,
+        species="p",
+        freq="monthly",
+        start_date=sim_period["start_date"].strftime("%Y-%m-%d"),
+    )
+    print(f"P monthly: {len(p_monthly)} time steps loaded")
+except FileNotFoundError as e:
+    p_monthly = None
+    print(f"⚠ {e}")
+```
+
+### 9.2  Concentration maps
+
+```{python}
+import matplotlib.pyplot as plt
+
+if no3_monthly:
+    # Plot last available month
+    last_key = list(no3_monthly.keys())[-1]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    plot_conc_map(no3_monthly[last_key], title=f"NO₃ — {last_key}",
+                  cmap="YlOrRd", ax=axes[0])
+
+    if p_monthly:
+        last_key_p = list(p_monthly.keys())[-1]
+        plot_conc_map(p_monthly[last_key_p], title=f"P — {last_key_p}",
+                      cmap="YlGnBu", ax=axes[1])
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No RT3D concentration output available — skipping maps.")
+```
+
+### 9.3  GW–SW nutrient exchange
+
+```{python}
+from swatmf.outputs.rt3d import read_rt3d_rivflux, plot_rivflux_ts
+
+try:
+    no3_flux = read_rt3d_rivflux(
+        wd, species="no3", by="subbasin",
+        start_date=sim_period["start_date"].strftime("%Y-%m-%d"),
+    )
+    ax = plot_rivflux_ts(no3_flux, species="NO₃")
+    plt.tight_layout()
+    plt.show()
+    print(f"NO₃ GW-SW flux: {len(no3_flux)} time steps, "
+          f"{no3_flux.shape[1]} subbasins")
+except FileNotFoundError as e:
+    no3_flux = None
+    print(f"⚠ {e}")
+```
+
+```{python}
+try:
+    p_flux = read_rt3d_rivflux(
+        wd, species="p", by="subbasin",
+        start_date=sim_period["start_date"].strftime("%Y-%m-%d"),
+    )
+    ax = plot_rivflux_ts(p_flux, species="P")
+    plt.tight_layout()
+    plt.show()
+except FileNotFoundError as e:
+    p_flux = None
+    print(f"⚠ {e}")
+```
+
+### 9.4  Recharge nutrient concentrations
+
+```{python}
+from swatmf.outputs.rt3d import read_rt3d_recharge_conc
+
+try:
+    rech_no3 = read_rt3d_recharge_conc(
+        wd, species="no3", by="subbasin",
+        start_date=sim_period["start_date"].strftime("%Y-%m-%d"),
+    )
+    print(f"NO₃ recharge conc: {len(rech_no3)} time steps, "
+          f"{rech_no3.shape[1]} subbasins")
+    print(rech_no3.describe().round(4))
+except FileNotFoundError as e:
+    rech_no3 = None
+    print(f"⚠ {e}")
+```
+
+---
+
+## 10  Performance Metrics Summary
 
 Aggregate all available metrics into a single summary table.
 
@@ -1275,14 +1495,17 @@ swatmf/
 ├── simulation.py            # SwatmfLinkConfig, write/read swatmf_link.txt
 ├── preprocessing/
 │   ├── __init__.py
-│   └── modflow.py           # parse_dis_file, create_mf_model, modflow.obs, etc.
+│   ├── modflow.py           # parse_dis_file, create_mf_model, modflow.obs, etc.
+│   ├── linking.py           # generate_link_tables (hru_dhru, dhru_grid)
+│   └── rt3d.py             # RT3DConfig, write_rt3d_model (BTN/DSP/RCT/GCG/ADV/SSM)
 └── outputs/
     ├── __init__.py
     ├── streamflow.py        # post_i_sw.py  → get_streamflow, plot_streamflow
     ├── groundwater.py       # post_ii_gw.py → get_groundwater, plot_groundwater
     ├── recharge.py          # post_iii_rch.py → get_recharge, plot_recharge_*
     ├── gwsw.py              # post_iv_gwsw.py → get_gwsw, plot_gwsw_timeseries
-    └── water_balance.py     # post_v_wb.py → get_water_balance, plot_water_balance
+    ├── water_balance.py     # post_v_wb.py → get_water_balance, plot_water_balance
+    └── rt3d.py              # post_vii_nitrate.py → read_rt3d_conc, plot_conc_map
 ```
 
 ### Correspondence to QSWATMOD2 plugin tabs
@@ -1295,10 +1518,12 @@ swatmf/
 | Build MF model (flopy) | **Pre-Processing** / `writeMF.writeMFmodel` | `swatmf.preprocessing.modflow.create_mf_model` |
 | modflow.obs | **Pre-Processing** / `modflow_functions.export_modflow_obs` | `swatmf.preprocessing.modflow.create_modflow_obs` |
 | River connections | **Pre-Processing** / `modflow_functions.mf_riv*` | `swatmf.preprocessing.modflow.parse_riv_file` |
+| RT3D input files | **Pre-Processing** / `write_rt3d.write_rt3d_inputs` | `swatmf.preprocessing.rt3d.write_rt3d_model` |
 | swatmf_link.txt | **Simulation** / `runSim_link.create_swatmf_link` | `swatmf.simulation.write_swatmf_link` |
 | Streamflow | **Post-Processing** / `post_i_sw.py` | `swatmf.outputs.streamflow` |
 | Groundwater levels | **Post-Processing** / `post_ii_gw.py` | `swatmf.outputs.groundwater` |
 | MODFLOW recharge | **Post-Processing** / `post_iii_rch.py` | `swatmf.outputs.recharge` |
 | GW-SW exchange | **Post-Processing** / `post_iv_gwsw.py` | `swatmf.outputs.gwsw` |
 | Water balance | **Post-Processing** / `post_v_wb.py` | `swatmf.outputs.water_balance` |
+| RT3D concentrations | **Post-Processing** / `post_vii_nitrate.py` | `swatmf.outputs.rt3d` |
 | Objective functions | `pyfolder/utils.py ObjFns` | `swatmf.metrics` |
