@@ -1214,6 +1214,7 @@ wb_df.head()
 
 ```{python}
 fig, axes = plot_water_balance(wb_df, timescale=WB_TIMESCALE)
+plt.show()
 ```
 
 ### 8.2  Export
