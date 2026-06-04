@@ -524,29 +524,32 @@ def write_swatmf_river2grid(
     df = river_grid_df.copy()
     df["grid_id"]  = df["grid_id"].astype(int)
     df["subbasin"] = df["subbasin"].astype(int)
+    df = df.sort_values(["grid_id", "subbasin"]).reset_index(drop=True)
 
-    # Deduplicate to one entry per grid cell: keep the subbasin with the
-    # longest river segment in that cell (matches CreateSWATMF.exe behaviour —
-    # the executable reads one RIV-package entry per grid cell, so
-    # swatmf_river2grid.txt must have exactly one row per unique grid_id).
-    df = (
-        df.sort_values("rgrid_len", ascending=False)
-          .drop_duplicates(subset="grid_id", keep="first")
-          .sort_values("grid_id")
-          .reset_index(drop=True)
-    )
+    # Group by grid_id so each unique river cell becomes one record.
+    # The third field on line 1 is n_subbasins (the count of subbasins
+    # crossed by that cell), NOT the subbasin ID.  Subsequent lines list
+    # all subbasin IDs, then all lengths — matching CreateSWATMF.exe output.
+    groups = df.groupby("grid_id", sort=True)
+    n_riv = len(groups)
 
     out_path = os.path.join(str(swatmf_folder), "swatmf_river2grid.txt")
     with open(out_path, "wb") as fh:
-        fh.write(f"{len(df):13d}\r\n".encode())
-        for i, row in df.iterrows():
-            river_id = int(i) + 1
+        # Header: %12d (CreateSWATMF.exe uses 12-wide, not 13)
+        fh.write(f"{n_riv:12d}\r\n".encode())
+        for river_id, (grid_id, grp) in enumerate(groups, 1):
+            subs = grp["subbasin"].tolist()
+            lens = grp["rgrid_len"].tolist()
+            n_sub = len(subs)
+            # Line 1: river_id  grid_id  n_subbasins
             fh.write(
-                f"{river_id:13d}{int(row['grid_id']):13d}"
-                f"{int(row['subbasin']):13d}\r\n".encode()
+                ("".join(f"{v:13d}" for v in [river_id, int(grid_id), n_sub])
+                 + "\r\n").encode()
             )
-            fh.write(f"{layer:13d}\r\n".encode())
-            fh.write(f"{float(row['rgrid_len']):13.5f}\r\n".encode())
+            # Line 2: subbasin IDs (all on one line)
+            fh.write(("".join(f"{s:13d}" for s in subs) + "\r\n").encode())
+            # Line 3: river lengths (all on one line)
+            fh.write(("".join(f"{l:13.5f}" for l in lens) + "\r\n").encode())
     return out_path
 
 
