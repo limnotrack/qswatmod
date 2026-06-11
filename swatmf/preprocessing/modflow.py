@@ -14,7 +14,7 @@ Functions exposed
 parse_dis_file         — Parse a MODFLOW discretisation (.dis) file via flopy.
 grid_row_col           — Build full (row, col) arrays for every grid cell.
 parse_riv_file         — Parse a MODFLOW river-package (.riv) file.
-write_riv_file         — Overwrite a MODFLOW river-package (.riv) file.
+write_riv_file         — Write (or overwrite) a MODFLOW river-package (.riv) file.
 compute_riv_params     — Derive RIV parameters from a ``river_grid`` table.
 create_modflow_obs     — Write the ``modflow.obs`` observation file.
 read_modflow_obs       — Read an existing ``modflow.obs`` into a DataFrame.
@@ -374,40 +374,71 @@ def write_riv_file(
     swatmf_folder: str | os.PathLike,
     riv_df: pd.DataFrame,
 ) -> str:
-    """Overwrite the MODFLOW ``.riv`` file with updated river-cell data.
+    """Write (or overwrite) the MODFLOW ``.riv`` file with river-cell data.
 
-    The input DataFrame must contain columns ``layer``, ``row``, ``col``,
-    ``stage``, ``cond``, ``rbot`` — i.e. the same columns produced by
-    :func:`parse_riv_file` or by the QGIS linking process after
-    ``overwriteRivPac``.
+    Accepts both the column names produced by :func:`parse_riv_file`
+    (``stage``, ``cond``, ``rbot``) and those produced by
+    :func:`compute_riv_params` (``riv_stage``, ``riv_cond``, ``riv_bot``).
+
+    If no ``.riv`` file already exists in *swatmf_folder* a new one is
+    created, deriving the filename from the ``.nam`` file's model name (or
+    falling back to ``"modflow.riv"``).
 
     Parameters
     ----------
     swatmf_folder : str or path-like
         SWAT-MODFLOW working directory.
     riv_df : pd.DataFrame
-        River-cell data sorted by ``grid_id`` (or just sequentially).
+        River-cell data.  Required columns: ``row``, ``col``, and one of
+        (``stage`` / ``riv_stage``), (``cond`` / ``riv_cond``),
+        (``rbot`` / ``riv_bot``).  ``layer`` defaults to 1 if absent.
 
     Returns
     -------
     str
-        Absolute path to the overwritten ``.riv`` file.
+        Absolute path to the written ``.riv`` file.
     """
-    path = _find_single_file(str(swatmf_folder), ".riv")
-    n = len(riv_df)
+    folder = str(swatmf_folder)
+
+    # ── Resolve column name variants ─────────────────────────────────────────
+    df = riv_df.rename(columns={
+        "riv_stage": "stage",
+        "riv_cond":  "cond",
+        "riv_bot":   "rbot",
+    })
+
+    # ── Resolve file path (create if missing) ────────────────────────────────
+    riv_matches = glob.glob(os.path.join(folder, "*.riv"))
+    if riv_matches:
+        path = riv_matches[0]
+        action = "overwritten"
+    else:
+        # Derive name from the .nam file; fall back to "modflow.riv".
+        nam_matches = glob.glob(os.path.join(folder, "*.nam"))
+        if nam_matches:
+            stem = os.path.splitext(os.path.basename(nam_matches[0]))[0]
+        else:
+            stem = "modflow"
+        path = os.path.join(folder, f"{stem}.riv")
+        action = "created"
+
+    n = len(df)
     ts = datetime.datetime.now().strftime("- %m/%d/%y %H:%M:%S -")
     header = (
-        f"# {os.path.basename(path)} overwritten by swatmf package "
+        f"# {os.path.basename(path)} {action} by swatmf package "
         f"{_EXPORT_VERSION}{ts}"
     )
-    n_row = f"{n}\t0\t\t\t# Number of river cells"
+    # MODFLOW Fortran reads the first two lines as plain integers — must NOT be
+    # CSV-quoted.  Write them directly rather than through csv.writer so that
+    # fields containing the tab delimiter are never wrapped in double-quotes.
+    n_header = f"{n}\t0\t\t\t# Number of river cells"
 
     with open(path, "w", newline="") as fh:
+        fh.write(header + "\r\n")
+        fh.write(n_header + "\r\n")
+        fh.write(n_header + "\r\n")  # written twice — matches plugin behaviour
         writer = csv.writer(fh, delimiter="\t")
-        writer.writerow([header])
-        writer.writerow([n_row])
-        writer.writerow([n_row])  # written twice — matches plugin behaviour
-        for _, r in riv_df.iterrows():
+        for _, r in df.iterrows():
             writer.writerow(
                 [
                     int(r.get("layer", 1)),
@@ -488,23 +519,32 @@ def compute_riv_params(
 def create_modflow_obs(
     swatmf_folder: str | os.PathLike,
     obs_df: pd.DataFrame,
+    *,
+    output_dir: str | os.PathLike | None = None,
 ) -> str:
     """Write the ``modflow.obs`` observation-cell file.
 
     Parameters
     ----------
     swatmf_folder : str or path-like
-        SWAT-MODFLOW working directory (output destination).
+        SWAT-MODFLOW working directory that contains the ``.dis`` file.
+        Used to resolve ``row``/``col`` from ``grid_id`` when those columns
+        are absent.  Also used as the output directory unless *output_dir*
+        is given.
     obs_df : pd.DataFrame
-        Observation-cell table with **at least** columns:
+        Observation-cell table.  May be empty (zero rows) — in that case a
+        header-only file with ``0`` cells is written and the ``.dis`` file is
+        not read.  When non-empty, must contain at least:
 
         * ``grid_id`` — MODFLOW grid cell ID (integer, 1-based)
         * ``layer``   — MODFLOW layer number (integer, usually 1)
         * ``top_elev``— land-surface elevation at the cell centre (float)
 
-        The ``row`` and ``col`` columns will be **computed automatically**
-        from the ``grid_id`` and the ``.dis`` file if they are not already
-        present.
+        The ``row`` and ``col`` columns are computed automatically from
+        ``grid_id`` and the ``.dis`` file if they are not already present.
+    output_dir : str or path-like, optional
+        Directory where ``modflow.obs`` is written.  Defaults to
+        *swatmf_folder* when omitted.
 
     Returns
     -------
@@ -529,11 +569,22 @@ def create_modflow_obs(
     >>> obs = pd.DataFrame({"grid_id": [10, 45], "layer": [1, 1], "top_elev": [123.4, 119.7]})
     >>> path = create_modflow_obs(wd, obs)
     """
-    wd = str(swatmf_folder)
+    wd      = str(swatmf_folder)
+    out_dir = str(output_dir) if output_dir is not None else wd
+    df      = obs_df.copy()
+
+    if len(df) == 0:
+        # No wells — write a zero-record file without reading the .dis file.
+        out_path = os.path.join(out_dir, "modflow.obs")
+        with open(out_path, "w", newline="") as fh:
+            fh.write("MODFLOW observation cells (number of cells, I,J,K for each cell)\n")
+            fh.write("0\n")
+        return out_path
+
+    # ── Non-empty: resolve row/col from grid_id via .dis ────────────────────
     dis = parse_dis_file(wd)
     rows_all, cols_all = grid_row_col(dis)
 
-    df = obs_df.copy()
     df["grid_id"] = df["grid_id"].astype(int)
     df = df.sort_values("grid_id").reset_index(drop=True)
 
@@ -553,7 +604,7 @@ def create_modflow_obs(
         df["row"] = [rows_all[gid - 1] for gid in df["grid_id"]]
         df["col"] = [cols_all[gid - 1] for gid in df["grid_id"]]
 
-    out_path = os.path.join(wd, "modflow.obs")
+    out_path = os.path.join(out_dir, "modflow.obs")
 
     with open(out_path, "w", newline="") as fh:
         fh.write("MODFLOW observation cells (number of cells, I,J,K for each cell)\n")
@@ -849,6 +900,30 @@ def create_modflow_mfn(swatmf_folder: str | os.PathLike) -> str:
                 f"modflow.mfn: Unit number {old_unit} → {new_unit}"
             )
         lines.append(line + "\n")
+
+    # If a .riv file is present but not yet listed, inject it before OC/DATA.
+    # SWAT-MODFLOW3.exe accesses MODFLOW's internal RIV package arrays when
+    # swatmf_river2grid.txt has any river cells; if the RIV package is absent
+    # from the name file those arrays are null → error 157 access violation.
+    riv_files = glob.glob(os.path.join(wd, "*.riv"))
+    already_listed = any(
+        ln.strip().upper().startswith("RIV") for ln in lines
+        if not ln.strip().startswith("#")
+    )
+    if riv_files and not already_listed:
+        riv_name = os.path.basename(riv_files[0])
+        riv_line = f"RIV\t5018\t{riv_name}\n"
+        # Insert before the first OC or DATA line
+        insert_at = len(lines)
+        for i, ln in enumerate(lines):
+            stripped = ln.strip()
+            if stripped and not stripped.startswith("#"):
+                tag = stripped.split()[0].upper()
+                if tag in ("OC", "DATA", "DATA(BINARY)"):
+                    insert_at = i
+                    break
+        lines.insert(insert_at, riv_line)
+        log_entries.append(f"modflow.mfn: injected RIV line for {riv_name}")
 
     mfn_path = os.path.join(wd, "modflow.mfn")
     with open(mfn_path, "w", encoding="utf-8") as fh:

@@ -80,68 +80,110 @@ def create_dhru(
     hru_id_col: str = "HRU_ID",
     hrugis_col: str = "HRUGIS",
 ) -> gpd.GeoDataFrame:
-    """Explode multipart HRU polygons to singlepart disaggregated HRUs (dHRUs).
+    """Create disaggregated HRU (dHRU) polygons from a SWAT HRU shapefile.
 
-    Mirrors the ``multipart_to_singlepart → create_temp_id → create_dhru_id
-    → calculate_area(dhru_area)`` sequence from the QGIS plugin.
+    Matches the QSWATMOD2 / CreateSWATMF.exe approach:
+
+    1. Drop features with ``HRUGIS="NA"`` (sub-threshold areas not simulated).
+    2. Assign a sequential ``HRU_ID`` (1 … n_unique_HRUGIS) to each valid feature
+       so that all spatial fragments that share a HRUGIS code belong to the same
+       HRU.
+    3. Explode multi-part polygons to singlepart — each resulting singlepart
+       polygon becomes one dHRU.
+    4. Assign a global sequential ``dhru_id`` (1 … N_total_fragments).
+
+    This produces many DHRUs per HRU (the ratio is typically 30–100:1 for a
+    fragmented watershed shapefile), matching the working example files in
+    ``data/SWAT-MODFLOW/GIS/SMshps``.
+
+    The SWAT-MODFLOW Fortran executable couples by **subbasin**, not by SWAT
+    sequential HRU number.  Any SWAT HRU whose subbasin is represented in
+    ``swatmf_dhru2hru.txt`` is automatically included; sub-threshold HRUs that
+    share a subbasin with a spatial HRU still contribute deep percolation to
+    the same MODFLOW cells.
 
     Parameters
     ----------
     hru_gdf : GeoDataFrame
-        SWAT HRU polygons.  Must contain *hru_id_col* (typically ``HRU_ID``).
-        If the column is absent it is created by sorting on *hrugis_col*
-        (``HRUGIS``).  The field ``hru_area`` is added if missing.
+        SWAT HRU polygons (typically from ``hru1.shp``).  Must contain
+        *hrugis_col* (``HRUGIS``).
     hru_id_col : str, optional
-        Column name for the integer HRU identifier.  Default ``"HRU_ID"``.
+        Column name used for HRU identification when ``HRUGIS`` is absent.
+        Default ``"HRU_ID"``.
     hrugis_col : str, optional
-        Column used to derive a stable sort order when *hru_id_col* must be
-        created.  Default ``"HRUGIS"``.
+        Column identifying the simulation HRU (QSWAT/QSWAT+ ``HRUGIS`` code).
+        Default ``"HRUGIS"``.
 
     Returns
     -------
     GeoDataFrame
-        Singlepart polygons with columns:
+        One row per dHRU singlepart polygon with columns:
 
-        * ``HRU_ID`` — parent HRU identifier (1-based integer)
-        * ``hru_area`` — area of the *original* (multipart) HRU polygon [m²]
-        * ``dhru_id`` — sequential dHRU identifier (1-based, sorted by HRU_ID)
-        * ``dhru_area`` — area of this singlepart polygon [m²]
+        * ``HRU_ID``   — spatial HRU sequential ID (1 … n_unique_HRUGIS)
+        * ``HRUGIS``   — original QSWAT HRU code (``SSSSSHHHHH`` format)
+        * ``hru_area`` — total area of this HRU (sum of all its dHRU fragments)
+        * ``dhru_id``  — global sequential dHRU ID (1 … N_total_fragments)
+        * ``dhru_area``— area of this singlepart polygon fragment
 
     Examples
     --------
     >>> import geopandas as gpd
-    >>> hru = gpd.read_file("GIS/SMshps/hru_link.gpkg")
+    >>> hru = gpd.read_file("GIS/org_shps/hru_org.shp")
     >>> dhru = create_dhru(hru)
-    >>> dhru[["HRU_ID", "hru_area", "dhru_id", "dhru_area"]].head()
+    >>> print(f"{len(dhru)} dHRUs from {dhru['HRU_ID'].nunique()} HRUs")
     """
     gdf = _fix_geometries(hru_gdf.copy())
 
-    # --- ensure HRU_ID -------------------------------------------------------
-    if hru_id_col not in gdf.columns:
-        if hrugis_col in gdf.columns:
-            gdf = gdf.sort_values(hrugis_col).reset_index(drop=True)
-            gdf["HRU_ID"] = range(1, len(gdf) + 1)
-        else:
-            gdf = gdf.reset_index(drop=True)
-            gdf["HRU_ID"] = range(1, len(gdf) + 1)
+    if hrugis_col in gdf.columns:
+        # --- STEP 1: drop sub-threshold "NA" features -------------------------
+        valid_mask = (
+            gdf[hrugis_col].notna()
+            & (gdf[hrugis_col].astype(str).str.strip().str.upper() != "NA")
+        )
+        n_dropped = (~valid_mask).sum()
+        if n_dropped:
+            import warnings
+            warnings.warn(
+                f"create_dhru: dropping {n_dropped} features with HRUGIS='NA' "
+                f"(sub-threshold HRUs not present in TxtInOut).",
+                stacklevel=2,
+            )
+        gdf = gdf[valid_mask].copy()
+
+        # --- STEP 2: assign sequential HRU_ID per unique HRUGIS ---------------
+        if "hru_area" not in gdf.columns:
+            gdf["hru_area"] = gdf.geometry.area
+
+        # Build HRUGIS → HRU_ID map (sorted for reproducibility)
+        unique_hrugis = sorted(gdf[hrugis_col].unique())
+        hrugis_to_hru_id = {h: i + 1 for i, h in enumerate(unique_hrugis)}
+        gdf["HRU_ID"] = gdf[hrugis_col].map(hrugis_to_hru_id)
+
+        # Total HRU area = sum of all fragment areas with the same HRUGIS
+        hru_total_area = gdf.groupby(hrugis_col)["hru_area"].sum()
+        gdf["hru_area"] = gdf[hrugis_col].map(hru_total_area)
+
     else:
-        gdf = gdf.rename(columns={hru_id_col: "HRU_ID"})
+        # --- Fallback: no HRUGIS column ----------------------------------------
+        if hru_id_col not in gdf.columns:
+            gdf = gdf.reset_index(drop=True)
+            gdf[hru_id_col] = range(1, len(gdf) + 1)
+        gdf["HRU_ID"] = gdf[hru_id_col]
+        if "hru_area" not in gdf.columns:
+            gdf["hru_area"] = gdf.geometry.area
+        if hrugis_col not in gdf.columns:
+            gdf[hrugis_col] = gdf["HRU_ID"].astype(str)
 
-    # --- hru_area (original polygon area) ------------------------------------
-    if "hru_area" not in gdf.columns:
-        gdf["hru_area"] = gdf.geometry.area
+    gdf = gdf.rename(columns={hrugis_col: "HRUGIS"})
 
-    # --- multipart → singlepart (dhru) ---------------------------------------
+    # --- STEP 3: explode multi-part → singlepart dHRUs -----------------------
     dhru = gdf.explode(index_parts=False).reset_index(drop=True)
 
-    # --- dhru_id: sequential, sorted by HRU_ID ------------------------------
-    dhru = dhru.sort_values("HRU_ID").reset_index(drop=True)
-    dhru["dhru_id"] = range(1, len(dhru) + 1)
-
-    # --- dhru_area (area of each singlepart polygon) -------------------------
+    # --- STEP 4: assign global sequential dhru_id ----------------------------
+    dhru["dhru_id"]  = range(1, len(dhru) + 1)
     dhru["dhru_area"] = dhru.geometry.area
 
-    return dhru[["HRU_ID", "hru_area", "dhru_id", "dhru_area", "geometry"]]
+    return dhru[["HRU_ID", "HRUGIS", "hru_area", "dhru_id", "dhru_area", "geometry"]]
 
 
 # ---------------------------------------------------------------------------
@@ -188,9 +230,14 @@ def build_hru_dhru(
     if subbasin_col != "Subbasin" and subbasin_col in sub.columns:
         sub = sub.rename(columns={subbasin_col: "Subbasin"})
 
+    # Keep HRUGIS if present (needed downstream to map DHRUs → SWAT HRU IDs)
+    dhru_cols = ["HRU_ID", "hru_area", "dhru_id", "dhru_area", "geometry"]
+    if "HRUGIS" in dhru_gdf.columns:
+        dhru_cols = ["HRU_ID", "HRUGIS", "hru_area", "dhru_id", "dhru_area", "geometry"]
+
     # Spatial intersection (dhru × sub)
     intersected = gpd.overlay(
-        dhru_gdf[["HRU_ID", "hru_area", "dhru_id", "dhru_area", "geometry"]],
+        dhru_gdf[dhru_cols],
         sub[["Subbasin", "geometry"]],
         how="intersection",
         keep_geom_type=True,
@@ -204,9 +251,10 @@ def build_hru_dhru(
 
     # Dissolve at dhru_id × Subbasin level so each row is unique, then
     # compute area_f from the dissolved geometry in a single pass.
+    dissolve_cols = ["dhru_id", "Subbasin"]
     hru_dhru = (
         intersected
-        .dissolve(by=["dhru_id", "Subbasin"], aggfunc="first")
+        .dissolve(by=dissolve_cols, aggfunc="first")
         .reset_index()
     )
     hru_dhru["area_f"] = hru_dhru.geometry.area
@@ -214,7 +262,10 @@ def build_hru_dhru(
     # Drop slivers
     hru_dhru = hru_dhru[hru_dhru["area_f"] >= area_filter_m2].copy()
 
-    return hru_dhru[["HRU_ID", "hru_area", "dhru_id", "dhru_area", "Subbasin", "area_f", "geometry"]]
+    out_cols = ["HRU_ID", "hru_area", "dhru_id", "dhru_area", "Subbasin", "area_f", "geometry"]
+    if "HRUGIS" in hru_dhru.columns:
+        out_cols = ["HRU_ID", "HRUGIS", "hru_area", "dhru_id", "dhru_area", "Subbasin", "area_f", "geometry"]
+    return hru_dhru[out_cols]
 
 
 # ---------------------------------------------------------------------------
@@ -536,8 +587,22 @@ def write_swatmf_dhru2hru(
 ) -> str:
     """Write ``swatmf_dhru2hru.txt`` in the format read by SWAT-MODFLOW.
 
-    For each HRU lists the dHRUs it contains and the fractional area each
-    dHRU contributes to that HRU (area_overlap / sum_of_overlaps_in_HRU).
+    The header ``n_HRUs`` must equal the **total number of SWAT simulation
+    HRUs** (i.e. the number of ``.hru`` files in TxtInOut), not merely the
+    count of HRUs that have a spatial DHRU.  The Fortran executable allocates
+    coupling arrays sized ``n_HRUs`` and indexes them by SWAT's own sequential
+    HRU numbering; a mismatch causes an access-violation crash.
+
+    Parameters
+    ----------
+    hru_dhru_gdf : GeoDataFrame
+        Output of :func:`build_hru_dhru`.  ``HRU_ID`` values are the spatial
+        HRU sequential numbers (1 … n_unique_HRUGIS); they do **not** need to
+        match SWAT's internal sequential numbering.  The Fortran couples by
+        subbasin, so all SWAT HRUs in a given subbasin share the coupling of
+        the spatial HRU in that subbasin.
+    table_dir : str or path-like
+        Output directory.
 
     File format::
 
@@ -545,28 +610,36 @@ def write_swatmf_dhru2hru(
         <hru_id>  <n_dhrus>  <subbasin>
         <dhru_id_1>  ...  <dhru_id_n>
         <frac_1>   ...  <frac_n>
-        ... (one block per HRU)
+        ... (3 lines per HRU block)
     """
     df = hru_dhru_gdf.copy()
 
     hru_info: dict[int, tuple[int, list[int], list[float]]] = {}
     for hru_id, grp in df.groupby("HRU_ID"):
-        grp = grp.sort_values("dhru_id")
         sub = int(grp["Subbasin"].iloc[0])
-        dhru_ids = grp["dhru_id"].astype(int).tolist()
-        areas = grp["area_f"].tolist()
-        total = sum(areas) or 1.0
-        fracs = [a / total for a in areas]
+        # Deduplicate dhru_ids: the subbasin-overlay split can produce multiple
+        # rows for the same (HRU_ID, dhru_id) pair when a DHRU polygon straddles
+        # a subbasin boundary.  Sum their area_f fractions so each dhru_id is
+        # listed only once, matching the CreateSWATMF.exe output format.
+        agg = (
+            grp.groupby("dhru_id", as_index=False)["area_f"]
+            .sum()
+            .sort_values("dhru_id")
+        )
+        dhru_ids = agg["dhru_id"].astype(int).tolist()
+        areas = agg["area_f"].tolist()
+        total_area = sum(areas) or 1.0
+        fracs = [a / total_area for a in areas]
         hru_info[int(hru_id)] = (sub, dhru_ids, fracs)
 
-    n_hrus = len(hru_info)
-    max_dhru = max(len(v[1]) for v in hru_info.values()) if hru_info else 0
+    n_hrus = max(hru_info.keys(), default=0)
+    max_dhru = max((len(v[1]) for v in hru_info.values()), default=0)
 
     os.makedirs(str(table_dir), exist_ok=True)
     out_path = os.path.join(str(table_dir), "swatmf_dhru2hru.txt")
     with open(out_path, "w", newline="") as fh:
         fh.write(_fmt_ints([n_hrus, max_dhru]))
-        for hru_id in sorted(hru_info.keys()):
+        for hru_id in range(1, n_hrus + 1):
             sub, dhru_ids, fracs = hru_info[hru_id]
             fh.write(_fmt_ints([hru_id, len(dhru_ids), sub]))
             fh.write(_fmt_ints(dhru_ids))
@@ -909,33 +982,81 @@ def generate_link_tables(
         area_filter_m2=grid_area_filter_m2,
     )
 
-    # 5a — determine nrow / ncol for grid_dhru header
+    # 5a — determine nrow / ncol for grid_dhru header; read SWAT HRU ordering
     nrow: int | None = None
     ncol: int | None = None
+    total_swat_hrus: int | None = None
+    hrugis_to_swat_id: dict[str, int] = {}
+
     if swatmf_folder is not None:
+        _sf = str(swatmf_folder)
+        # Grid dimensions from the MODFLOW DIS file
         try:
             from swatmf.preprocessing.modflow import parse_dis_file
-            dis = parse_dis_file(swatmf_folder)
+            dis = parse_dis_file(_sf)
             nrow, ncol = dis.nrow, dis.ncol
         except Exception:
             pass  # fall back to inferring from grid shapefile
 
+        # SWAT HRU sequential ordering: sort .hru filenames — the file stem
+        # (e.g. "000010002") IS the HRUGIS code; alphabetical sort gives the
+        # same sequence SWAT uses to number HRUs internally.
+        import glob as _glob
+        hru_files = sorted(_glob.glob(os.path.join(_sf, "*.hru")))
+        if hru_files:
+            total_swat_hrus = len(hru_files)
+            for idx, fpath in enumerate(hru_files):
+                stem = os.path.splitext(os.path.basename(fpath))[0]
+                hrugis_to_swat_id[stem] = idx + 1  # 1-based
+
     if nrow is None or ncol is None:
         # Infer from the grid shapefile's bounding-box aspect ratio
-        n_cells = len(mfgrid_gdf)
-        # count distinct grid_id values to see if it's a complete grid
-        n_ids = mfgrid_gdf[grid_id_col].nunique() if grid_id_col in mfgrid_gdf.columns else n_cells
-        # simple square-root estimate — works for regular grids
+        n_ids = mfgrid_gdf[grid_id_col].nunique() if grid_id_col in mfgrid_gdf.columns else len(mfgrid_gdf)
         _side = int(math.sqrt(n_ids))
         nrow = _side
         ncol = n_ids // _side if _side > 0 else n_ids
 
-    # 5b — write human-readable table files (for QA/QC and post-processing)
+    # 5b — HRU_ID in hru_dhru_gdf is the spatial HRU sequential number (1 … n_unique_HRUGIS).
+    #      The Fortran couples by subbasin, so this spatial numbering is correct as-is.
+    #      No remapping to SWAT sequential .hru file numbers is needed or desired.
+
+    # 5b-post: Renumber dhru_ids to a CONTIGUOUS 1…N sequence covering only the
+    # DHRUs that actually intersect the MODFLOW grid (i.e. appear in dhru_grid_gdf).
+    #
+    # Without this step, explode() produces dhru_ids 1…28983 but only ~14845 of
+    # those land inside the MODFLOW domain.  grid2dhru then has header n_dhrus=14845
+    # while dhru2hru still references ids up to 28983.  The Fortran allocates
+    # dhru arrays sized by grid2dhru's header value, so any dhru_id > 14845 in
+    # dhru2hru triggers an array-index-out-of-bounds crash (error 157).
+    #
+    # Renumbering guarantees:
+    #   • grid2dhru  header n_dhrus = N  and all dhru_ids in [1, N]
+    #   • dhru2hru   references only those same ids   → max(dhru_id) ≤ N
+    if len(dhru_grid_gdf) > 0 and "dhru_id" in dhru_grid_gdf.columns:
+        # Build a mapping: old dhru_id (from explode) → new sequential id
+        valid_old_ids = sorted(dhru_grid_gdf["dhru_id"].astype(int).unique())
+        old_to_new: dict[int, int] = {old: new for new, old in enumerate(valid_old_ids, start=1)}
+
+        # Apply to dhru_grid_gdf
+        dhru_grid_gdf = dhru_grid_gdf.copy()
+        dhru_grid_gdf["dhru_id"] = dhru_grid_gdf["dhru_id"].astype(int).map(old_to_new)
+
+        # Apply to hru_dhru_gdf — drop DHRUs that have no grid intersection
+        if "dhru_id" in hru_dhru_gdf.columns:
+            hru_dhru_gdf = hru_dhru_gdf.copy()
+            hru_dhru_gdf["dhru_id"] = (
+                hru_dhru_gdf["dhru_id"].astype(int).map(old_to_new)
+            )
+            # Drop rows where dhru_id mapped to NaN (outside MODFLOW domain)
+            hru_dhru_gdf = hru_dhru_gdf.dropna(subset=["dhru_id"]).copy()
+            hru_dhru_gdf["dhru_id"] = hru_dhru_gdf["dhru_id"].astype(int)
+
+    # 5c — write human-readable table files (for QA/QC and post-processing)
     hd_path = export_hru_dhru(hru_dhru_gdf, table_dir)
     dg_path = export_dhru_grid(dhru_grid_gdf, mfgrid_gdf, table_dir, grid_id_col=grid_id_col)
     gd_path = export_grid_dhru(dhru_grid_gdf, table_dir, nrow=nrow, ncol=ncol)
 
-    # 5c — write SWAT-MODFLOW executable input files (CreateSWATMF.exe format)
+    # 5d — write SWAT-MODFLOW executable input files (CreateSWATMF.exe format)
     #      These are the files the SWAT-MODFLOW executable actually reads.
     d2h_path = write_swatmf_dhru2hru(hru_dhru_gdf, table_dir)
     d2g_path = write_swatmf_dhru2grid(dhru_grid_gdf, nrow * ncol, table_dir)

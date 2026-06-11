@@ -58,6 +58,12 @@ def read_mf_obs(swatmf_folder: str | os.PathLike) -> pd.DataFrame:
     wd = str(swatmf_folder)
     path = os.path.join(wd, "modflow.obs")
 
+    # Return an empty DataFrame (with correct columns) when the file is absent
+    if not os.path.exists(path):
+        empty = pd.DataFrame(columns=["row", "col", "layer", "mf_elev"])
+        empty.index.name = "grid_id"
+        return empty
+
     # Parse the file manually to handle both old and new formats
     rows = []
     with open(path) as fh:
@@ -201,9 +207,21 @@ def read_swatmf_out_MF_obs(swatmf_folder: str | os.PathLike) -> tuple[pd.DataFra
         *output_wt*: simulated water-table heads, one column per grid cell.
     """
     mf_obs = read_mf_obs(swatmf_folder)
+    if len(mf_obs) == 0:
+        raise RuntimeError(
+            "No observation wells are defined (modflow.obs is absent or empty). "
+            "Add at least one observation cell to modflow.obs before calling "
+            "groundwater output functions."
+        )
     grid_id_lst = mf_obs.index.astype(str).values.tolist()
+    obs_out = os.path.join(str(swatmf_folder), "swatmf_out_MF_obs")
+    if not os.path.exists(obs_out):
+        raise RuntimeError(
+            f"Simulation output file not found: {obs_out!r}. "
+            "Run the SWAT-MODFLOW simulation before reading groundwater output."
+        )
     output_wt = pd.read_csv(
-        os.path.join(str(swatmf_folder), "swatmf_out_MF_obs"),
+        obs_out,
         sep=r"\s+",
         skiprows=1,
         names=grid_id_lst,
