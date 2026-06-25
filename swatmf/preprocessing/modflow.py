@@ -1366,6 +1366,1351 @@ def import_mf_grid(
 
 
 # ---------------------------------------------------------------------------
+# swatmf_drain2sub.txt — link drain cells to SWAT subbasins
+# ---------------------------------------------------------------------------
+
+def write_drain2sub(
+    mf_folder: str | os.PathLike,
+    sub_path: "str | os.PathLike | gpd.GeoDataFrame",
+    *,
+    mfgrid_path: str | os.PathLike | None = None,
+    sub_col: str = "Subbasin",
+    out_path: str | os.PathLike | None = None,
+) -> str:
+    """Write ``swatmf_drain2sub.txt`` mapping each DRN cell to a SWAT subbasin.
+
+    When ``drain_cells = True`` is set in ``swatmf_link.txt``, the SWAT-MODFLOW
+    executable reads this file at start-up to know which subbasin channel each
+    MODFLOW drain cell discharges into.  One subbasin number is written per
+    drain cell, in the same order as the entries in the ``.drn`` file.
+
+    Drain cells that straddle multiple subbasins are assigned to the subbasin
+    with the largest intersection area.  Drain cells that fall outside all
+    subbasins (e.g. in the GW-only domain) are assigned to the nearest subbasin
+    centroid.
+
+    File format (matches SWAT-MODFLOW Fortran reader)::
+
+        <N>                   ! number of drain cells
+        <subbasin_1>          ! one integer per cell, same order as .drn
+        <subbasin_2>
+        ...
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        MODFLOW model workspace (contains the ``.drn`` and ``.nam`` files).
+    sub_path : str, path-like, or GeoDataFrame
+        SWAT subbasin polygon layer (must be in the same CRS as the MFgrid).
+    mfgrid_path : str or path-like, optional
+        Path to the MFgrid shapefile / GeoPackage.  Searched automatically
+        inside *mf_folder* and common sibling GIS folders if omitted.
+    sub_col : str
+        Column name in *sub_path* that holds the integer subbasin number.
+        Default ``"Subbasin"``.
+    out_path : str or path-like, optional
+        Output path for the file.  Defaults to
+        ``<mf_folder>/swatmf_drain2sub.txt``.
+
+    Returns
+    -------
+    str
+        Path of the written file.
+    """
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    wd = str(mf_folder)
+
+    # ── Locate .drn file ─────────────────────────────────────────────────────
+    drn_files = glob.glob(os.path.join(wd, "*.drn"))
+    if not drn_files:
+        raise FileNotFoundError(
+            f"No .drn file found in {wd!r}.  "
+            "Run add_spring_drain() or burn_drain_to_point() first."
+        )
+    drn_file = drn_files[0]
+
+    # ── Parse DRN stress-period data (skip comment + 2 header lines) ─────────
+    drn_cells: list[tuple[int, int, int]] = []   # (layer, row, col)  1-based
+    with open(drn_file) as fh:
+        lines = [ln for ln in fh if not ln.strip().startswith("#")]
+
+    # Line 0: MXACTD  IDRNPB
+    # Line 1: ITMP  NP   (stress period 1)
+    # Lines 2+: layer row col elev conductance
+    for ln in lines[2:]:
+        parts = ln.split()
+        if len(parts) >= 3:
+            lay, row, col = int(parts[0]), int(parts[1]), int(parts[2])
+            drn_cells.append((lay, row, col))
+
+    n = len(drn_cells)
+    if n == 0:
+        raise ValueError(f"No drain cells found in {drn_file!r}")
+    print(f"  Drain cells read from {os.path.basename(drn_file)}: {n}")
+
+    # ── Load MFgrid ───────────────────────────────────────────────────────────
+    if mfgrid_path is None:
+        candidates = (
+            glob.glob(os.path.join(wd, "mf_grid.gpkg"))
+            + glob.glob(os.path.join(wd, "MFgrid*.shp"))
+            + glob.glob(os.path.join(wd, "*grid*.shp"))
+            + glob.glob(os.path.join(wd, "*grid*.gpkg"))
+        )
+        # Also look in sibling GIS folders
+        parent = os.path.dirname(wd)
+        for gis_sub in ["GIS/org_shps", "GIS", "org_shps", "shapefiles"]:
+            candidates += (
+                glob.glob(os.path.join(parent, gis_sub, "mf_grid.gpkg"))
+                + glob.glob(os.path.join(parent, gis_sub, "MFgrid*.shp"))
+                + glob.glob(os.path.join(parent, gis_sub, "*grid*.gpkg"))
+            )
+        mfgrid_path = next((p for p in candidates if os.path.isfile(p)), None)
+        if mfgrid_path is None:
+            raise FileNotFoundError(
+                "MFgrid shapefile not found.  Pass mfgrid_path= explicitly."
+            )
+
+    grid_gdf = gpd.read_file(str(mfgrid_path))
+    col_map  = {c: c.lower() for c in grid_gdf.columns}
+    grid_gdf = grid_gdf.rename(columns=col_map)
+
+    # ── Load subbasins ────────────────────────────────────────────────────────
+    if isinstance(sub_path, gpd.GeoDataFrame):
+        sub_gdf = sub_path.copy()
+    else:
+        sub_gdf = gpd.read_file(str(sub_path))
+
+    if grid_gdf.crs is not None and sub_gdf.crs is not None:
+        if grid_gdf.crs != sub_gdf.crs:
+            sub_gdf = sub_gdf.to_crs(grid_gdf.crs)
+
+    # ── Match each drain cell to its primary subbasin ─────────────────────────
+    # Build a GeoDataFrame of the drain cells from the grid
+    drn_df = gpd.GeoDataFrame(
+        {"layer":   [c[0] for c in drn_cells],
+         "row":     [c[1] for c in drn_cells],
+         "col":     [c[2] for c in drn_cells]},
+    )
+    drn_df = drn_df.merge(
+        grid_gdf[["row", "col", "grid_id", "geometry"]],
+        on=["row", "col"], how="left",
+    )
+    drn_df = gpd.GeoDataFrame(drn_df, geometry="geometry", crs=grid_gdf.crs)
+    drn_df["cell_area"] = drn_df.geometry.area
+
+    # Intersection-based join to find subbasins; keep largest overlap
+    intersected = gpd.overlay(
+        drn_df.reset_index().rename(columns={"index": "drn_idx"}),
+        sub_gdf[[sub_col, "geometry"]],
+        how="intersection",
+    )
+    intersected["_area"] = intersected.geometry.area
+    best = (
+        intersected.sort_values("_area", ascending=False)
+        .drop_duplicates(subset=["drn_idx"])
+        .set_index("drn_idx")
+    )
+
+    subbasin_map: dict[int, int] = {}
+    for i in range(n):
+        if i in best.index:
+            subbasin_map[i] = int(best.loc[i, sub_col])
+        else:
+            # Drain cell outside all subbasins — assign nearest centroid
+            cell_geom = drn_df.iloc[i].geometry
+            if cell_geom is None or cell_geom.is_empty:
+                subbasin_map[i] = int(sub_gdf[sub_col].iloc[0])
+            else:
+                cx, cy = cell_geom.centroid.x, cell_geom.centroid.y
+                dists = sub_gdf.geometry.centroid.distance(Point(cx, cy))
+                subbasin_map[i] = int(sub_gdf.iloc[dists.idxmin()][sub_col])
+            print(f"  Warning: drain cell row={drn_cells[i][1]} col={drn_cells[i][2]} "
+                  f"is outside all subbasins — assigned to subbasin {subbasin_map[i]}")
+
+    # ── Write the file ────────────────────────────────────────────────────────
+    # Format (from smrt_read_drain2sub Fortran source):
+    #   Line 1 : ndrn_subs  (count)
+    #   Line 2 : blank      (read(6007,*) discards it)
+    #   Lines 3+: drn_row  drn_col  sub_basin  (one per drain cell, 1-based)
+    if out_path is None:
+        out_path = os.path.join(wd, "swatmf_drain2sub.txt")
+
+    with open(str(out_path), "w") as fh:
+        fh.write(f"{n:12d}\n")
+        fh.write("\n")                          # blank line consumed by read(6007,*)
+        for i in range(n):
+            lay, row, col = drn_cells[i]
+            sub_num = subbasin_map[i]
+            fh.write(f"{row:12d}{col:12d}{sub_num:12d}\n")
+            print(f"  Drain {i+1}: row={row}  col={col}  → subbasin {sub_num}")
+
+    print(f"  Written: {out_path}")
+    return str(out_path)
+
+
+# ---------------------------------------------------------------------------
+# Internal helper – write a MODFLOW DRN file and splice it into the .nam
+# ---------------------------------------------------------------------------
+
+def _write_drn_and_update_nam(
+    wd: str,
+    nam_file: str,
+    drn_records: list,
+    layer: int,
+) -> str:
+    """Write a .drn file and inject the DRN line into *nam_file*.
+
+    Parameters
+    ----------
+    wd        : model workspace directory
+    nam_file  : full path to the .nam file
+    drn_records : list of (row1, col1, elev, conductance) tuples (1-based)
+    layer     : MODFLOW layer number (1-based)
+
+    Returns the path of the written .drn file.
+    """
+    mf_name_base = os.path.splitext(os.path.basename(nam_file))[0]
+    drn_path = os.path.join(wd, f"{mf_name_base}.drn")
+
+    n = len(drn_records)
+    with open(drn_path, "w") as fh:
+        fh.write("# DRN package written by swatmf\n")
+        fh.write(f"{n:10d}{0:10d}\n")       # MXACTD  IDRNPB
+        fh.write(f"{n:10d}{0:10d}\n")       # ITMP    NP  (stress period 1)
+        for r, c, elev, cond in drn_records:
+            fh.write(f"{layer:10d}{r:10d}{c:10d}{elev:15.4f}{cond:15.4f}\n")
+
+    drn_unit    = 21
+    drn_basename = os.path.basename(drn_path)
+    with open(nam_file, "r") as fh:
+        nam_lines = fh.readlines()
+
+    already_listed = any(
+        ln.strip().upper().startswith("DRN")
+        for ln in nam_lines
+        if not ln.strip().startswith("#")
+    )
+    if not already_listed:
+        drn_nam_line = f"DRN\t{drn_unit}\t{drn_basename}\n"
+        insert_at = len(nam_lines)
+        for i, ln in enumerate(nam_lines):
+            stripped = ln.strip()
+            if stripped and not stripped.startswith("#"):
+                tag = stripped.split()[0].upper()
+                if tag in ("OC", "DATA", "DATA(BINARY)"):
+                    insert_at = i
+                    break
+        nam_lines.insert(insert_at, drn_nam_line)
+        with open(nam_file, "w") as fh:
+            fh.writelines(nam_lines)
+        print(f"  DRN line injected into {os.path.basename(nam_file)}: unit {drn_unit}")
+    else:
+        # Update the existing line in-place (unit / filename stays the same)
+        print(f"  DRN already listed in {os.path.basename(nam_file)} — file overwritten in place")
+
+    return drn_path
+
+
+# ---------------------------------------------------------------------------
+# D8 flow-routing helpers
+# ---------------------------------------------------------------------------
+
+def _d8_flow_direction(dem: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (fdir_dr, fdir_dc) arrays — the row/col step of each cell's
+    steepest-descent neighbour.  NaN cells and flat cells with no downslope
+    neighbour get (-99, -99) (no valid direction)."""
+    nrow, ncol = dem.shape
+    # 8 neighbours: dr, dc, diagonal distance scale
+    neighbours = [
+        (-1, -1, np.sqrt(2)), (-1, 0, 1.0), (-1, 1, np.sqrt(2)),
+        ( 0, -1, 1.0),                       ( 0, 1, 1.0),
+        ( 1, -1, np.sqrt(2)), ( 1, 0, 1.0), ( 1, 1, np.sqrt(2)),
+    ]
+    best_slope = np.full((nrow, ncol), -np.inf)
+    fdir_dr    = np.full((nrow, ncol), -99, dtype=int)
+    fdir_dc    = np.full((nrow, ncol), -99, dtype=int)
+
+    for dr, dc, dist in neighbours:
+        # Source slice (the cell) and neighbour slice
+        r_src = slice(max(0, -dr), nrow + min(0, -dr) or None)
+        c_src = slice(max(0, -dc), ncol + min(0, -dc) or None)
+        r_nbr = slice(max(0,  dr), nrow + min(0,  dr) or None)
+        c_nbr = slice(max(0,  dc), ncol + min(0,  dc) or None)
+
+        src_elev = dem[r_src, c_src]
+        nbr_elev = dem[r_nbr, c_nbr]
+        slope    = (src_elev - nbr_elev) / dist
+
+        valid = np.isfinite(slope) & np.isfinite(src_elev) & np.isfinite(nbr_elev)
+        update = valid & (slope > best_slope[r_src, c_src])
+
+        # Write back into full arrays (need index offsets)
+        r0 = max(0, -dr); c0 = max(0, -dc)
+        for i, j in zip(*np.where(update)):
+            ri, ci = i + r0, j + c0
+            if slope[i, j] > best_slope[ri, ci]:
+                best_slope[ri, ci] = slope[i, j]
+                fdir_dr[ri, ci]    = dr
+                fdir_dc[ri, ci]    = dc
+
+    return fdir_dr, fdir_dc
+
+
+def _upstream_cells(
+    fdir_dr: np.ndarray,
+    fdir_dc: np.ndarray,
+    outlet_r: int,
+    outlet_c: int,
+) -> set[tuple[int, int]]:
+    """BFS upstream from (outlet_r, outlet_c) following D8 flow directions.
+    Returns a set of (row, col) indices (0-based) that drain to the outlet."""
+    nrow, ncol = fdir_dr.shape
+
+    # Build reverse map: for each cell, which cells point TO it?
+    # We do this lazily during BFS using the fdir arrays directly.
+    neighbours = [(-1, -1), (-1, 0), (-1, 1),
+                  ( 0, -1),           ( 0, 1),
+                  ( 1, -1), ( 1, 0), ( 1, 1)]
+
+    upstream: set[tuple[int, int]] = set()
+    queue = [(outlet_r, outlet_c)]
+    upstream.add((outlet_r, outlet_c))
+
+    while queue:
+        r, c = queue.pop()
+        for dr, dc in neighbours:
+            nr, nc = r + dr, c + dc
+            if not (0 <= nr < nrow and 0 <= nc < ncol):
+                continue
+            if (nr, nc) in upstream:
+                continue
+            # Does (nr, nc) flow into (r, c)?
+            if fdir_dr[nr, nc] == -dr and fdir_dc[nr, nc] == -dc:
+                upstream.add((nr, nc))
+                queue.append((nr, nc))
+
+    return upstream
+
+
+# ---------------------------------------------------------------------------
+# Shape initial hydraulic head toward a spring / drain outlet
+# ---------------------------------------------------------------------------
+
+def run_steady_state_spinup(
+    mf_folder: str | os.PathLike,
+    exe_path: str | os.PathLike,
+    *,
+    recharge_scale: float = 1.0,
+    silent: bool = True,
+) -> np.ndarray:
+    """Run a steady-state MODFLOW pass and write the result back as initial heads.
+
+    The workflow is:
+
+    1. Patch the ``.dis`` file: change the final stress-period flag ``TR``
+       (transient) to ``SS`` (steady-state).
+    2. Run MODFLOW with the patched DIS.
+    3. Read the resulting heads from the ``.hds`` file.
+    4. Write the steady-state heads as the new ``strt`` array in the BAS6
+       file using ``bas.write_file()`` — this avoids calling
+       ``mf.write_input()`` so the OC HEAD SAVE UNIT is never reset.
+    5. Restore the ``.dis`` file to ``TR`` so the model is ready for the
+       transient coupled run.
+
+    The head change you saw (−0.18 m uniform, +1.44 m near rivers) indicates
+    the initial heads were slightly above the true steady-state level overall
+    and that the river cells were acting as recharge sources.  This function
+    eliminates that spin-up artefact.
+
+    Parameters
+    ----------
+    mf_folder : path
+        MODFLOW model workspace (contains ``.nam``, ``.dis``, ``.bas`` etc.).
+    exe_path : path
+        Path to the MODFLOW-NWT executable.
+    recharge_scale : float
+        Multiplier applied to average recharge before the SS run.  Default
+        1.0 (use whatever the model already has).  Useful if you want to
+        represent long-term mean conditions differently from the transient
+        forcing.
+    silent : bool
+        Suppress MODFLOW console output.  Default True.
+
+    Returns
+    -------
+    np.ndarray
+        Steady-state head array (shape nrow × ncol, layer 1) written to
+        BAS6 as the new ``strt``.
+
+    Raises
+    ------
+    RuntimeError
+        If MODFLOW does not converge during the steady-state run.
+    """
+    import re as _re
+    import flopy
+    import flopy.utils.binaryfile as bf
+
+    wd = str(mf_folder)
+
+    # ── Locate files ─────────────────────────────────────────────────────────
+    dis_files = glob.glob(os.path.join(wd, "*.dis"))
+    bas_files = glob.glob(os.path.join(wd, "*.bas"))
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    hds_files = glob.glob(os.path.join(wd, "*.hds"))
+
+    if not dis_files:
+        raise FileNotFoundError(f"No .dis file found in {wd!r}")
+    if not bas_files:
+        raise FileNotFoundError(f"No .bas file found in {wd!r}")
+    if not nam_files:
+        raise FileNotFoundError(f"No .nam file found in {wd!r}")
+
+    dis_path = dis_files[0]
+
+    # Resolve the HDS path from the .nam file so we pick the right unit even
+    # when multiple .hds files exist.  The OC line "HEAD SAVE UNIT <n>" maps
+    # to whatever filename is on unit <n> in the .nam file.
+    hds_path = None
+    try:
+        with open(nam_files[0]) as fh:
+            nam_text = fh.read()
+        # Find "HEAD SAVE UNIT <n>" in OC file, then look up unit <n> in .nam
+        oc_files = glob.glob(os.path.join(wd, "*.oc"))
+        if oc_files:
+            with open(oc_files[0]) as fh:
+                oc_text = fh.read()
+            mu = _re.search(r'HEAD\s+SAVE\s+UNIT\s+(\d+)', oc_text, _re.I)
+            if mu:
+                unit = mu.group(1)
+                um = _re.search(
+                    rf'^\s*\S+\s+{unit}\s+(\S+)',
+                    nam_text, _re.I | _re.MULTILINE
+                )
+                if um:
+                    hds_path = os.path.join(wd, um.group(1))
+    except Exception:
+        pass
+    if hds_path is None:
+        hds_path = hds_files[0] if hds_files else os.path.join(wd, "modflow.hds")
+
+    # ── Step 1: patch DIS — TR → SS, NSTP → 1 ───────────────────────────────
+    with open(dis_path, encoding="utf-8") as fh:
+        dis_original = fh.read()
+
+    # Stress-period data line: PERLEN  NSTP  TSMULT  TR|SS
+    # e.g. "  16170.000000         16170  1.000000  TR"
+    # We change TR → SS AND force NSTP=1 so that OC's "period 1 step 1"
+    # fires at the single converged SS solution.  In MODFLOW-NWT, NSTP and
+    # TSMULT are ignored for SS stress periods, but the OC step counter
+    # still needs to see step 1 = last step for the save to occur.
+
+    def _patch_sp_line(m):
+        perlen, _, tsmult = m.group(1), m.group(2), m.group(3)
+        return f"{perlen}         1{tsmult}SS"
+
+    dis_patched = _re.sub(
+        r'([ \t]+[\d.E+\-]+[ \t]+)(\d+)([ \t]+[\d.E+\-]+[ \t]+)TR\b',
+        _patch_sp_line,
+        dis_original,
+    )
+    if dis_patched == dis_original:
+        print("  WARNING: stress-period 'TR' not found in .dis — may already "
+              "be SS or uses a numeric flag.  Proceeding anyway.")
+
+    with open(dis_path, "w", encoding="utf-8") as fh:
+        fh.write(dis_patched)
+    print(f"  DIS patched: TR → SS, NSTP → 1  ({os.path.basename(dis_path)})")
+
+    # ── Step 2: run MODFLOW (steady-state) ───────────────────────────────────
+    try:
+        success, buff = flopy.run_model(
+            str(exe_path),
+            os.path.basename(nam_files[0]),
+            model_ws=wd,
+            silent=silent,
+            report=True,
+        )
+    finally:
+        # ── Step 5: always restore DIS to TR, even if MODFLOW crashes ────────
+        with open(dis_path, "w", encoding="utf-8") as fh:
+            fh.write(dis_original)
+        print(f"  DIS restored: SS → TR  ({os.path.basename(dis_path)})")
+
+    if not success:
+        raise RuntimeError(
+            "MODFLOW did not converge during steady-state spin-up. "
+            "Check the .list file for details."
+        )
+    print("  Steady-state MODFLOW converged successfully.")
+
+    # ── Step 3: read steady-state heads ──────────────────────────────────────
+    hf = bf.HeadFile(hds_path)
+    ss_head = hf.get_data(totim=hf.get_times()[-1])[0]   # (nrow, ncol), layer 0
+
+    # ── Step 4: write new strt via BAS6.write_file() ─────────────────────────
+    # Load only DIS + BAS6 so we don't disturb OC unit numbers
+    with open(nam_files[0]) as fh:
+        nam_text = fh.read().upper()
+    load_only = [p for p in ["DIS", "BAS6"] if p in nam_text]
+
+    mf = flopy.modflow.Modflow.load(
+        os.path.basename(nam_files[0]),
+        model_ws=wd,
+        load_only=load_only,
+        check=False,
+    )
+    bas = mf.get_package("BAS6")
+    ibound = bas.ibound.array
+
+    # Inactive cells → 0
+    ss_strt = np.where(ibound[0] > 0, ss_head, 0.0)
+
+    bas_new = flopy.modflow.ModflowBas(
+        mf,
+        ibound=ibound,
+        strt=ss_strt[np.newaxis, :, :],
+    )
+    bas_new.write_file()
+    print(f"  BAS6 strt updated with steady-state heads  ({bas_files[0]})")
+
+    active = np.where(ibound[0] > 0, ss_strt, np.nan)
+    print(f"  Head range (active): {np.nanmin(active):.1f} – {np.nanmax(active):.1f} m")
+
+    return ss_strt
+
+
+def set_head_gradient_to_spring(
+    mf_folder: str | os.PathLike,
+    outlet_point,
+    *,
+    head_at_outlet: float | None = None,
+    head_offset_at_outlet: float = 0.5,
+    gradient: float | None = None,
+    fraction_of_relief: float = 0.15,
+    mfgrid_path: str | os.PathLike | None = None,
+    plot: bool = True,
+    plot_path: str | os.PathLike | None = None,
+) -> np.ndarray:
+    """Set the MODFLOW initial head (strt) as a smooth gradient toward the spring.
+
+    Rather than adding artificial drain cells to steer groundwater, this
+    function directly shapes the potentiometric surface so that the hydraulic
+    gradient already points toward the outlet.  MODFLOW's own physics then
+    routes water there without needing prescribed flow paths.
+
+    The head surface is constructed as::
+
+        h(r, c) = h_outlet + gradient × dist(r, c)
+
+    where ``dist`` is the Euclidean distance (m) from each active cell to the
+    outlet cell and ``gradient`` [m/m] is either supplied directly or estimated
+    from the active-domain extent and ``fraction_of_relief``.
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        MODFLOW model workspace.
+    outlet_point : GeoDataFrame, (x, y) tuple, or (row, col) tuple
+        Spring / drain outlet location.  Same formats accepted as
+        ``burn_drain_to_point``.
+    head_at_outlet : float, optional
+        Hydraulic head prescribed at the outlet cell (m NZTM).  If omitted,
+        the cell's top elevation minus *head_offset_at_outlet* is used.
+    head_offset_at_outlet : float
+        Depth below land surface at the outlet cell used when
+        *head_at_outlet* is not supplied.  Default 0.5 m.
+    gradient : float, optional
+        Hydraulic gradient [m/m] applied uniformly away from the outlet.
+        If omitted, inferred from *fraction_of_relief* and the domain extent.
+    fraction_of_relief : float
+        Fraction of the active-domain topographic relief used to set the
+        head range when *gradient* is not supplied.  Default 0.15 (15%).
+        Increase toward 0.3 for steep catchments; decrease toward 0.05 for
+        nearly flat aquifers.
+    mfgrid_path : str or path-like, optional
+        Path to MFgrid shapefile for spatial snapping.  Searched
+        automatically if omitted.
+    plot : bool
+        If True (default), generate a two-panel verification figure showing
+        the new head surface and the implied flow direction vectors.
+    plot_path : str or path-like, optional
+        Save the figure to this path.  If omitted the figure is shown
+        interactively (or written to ``<mf_folder>/head_gradient_check.png``
+        when running non-interactively).
+
+    Returns
+    -------
+    np.ndarray
+        The new strt array (shape nrow × ncol), with nodata cells set to 0.
+    """
+    wd = str(mf_folder)
+
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    if not nam_files:
+        raise FileNotFoundError(f"No .nam file found in {wd}")
+
+    mf = flopy.modflow.Modflow.load(
+        os.path.basename(nam_files[0]),
+        model_ws=wd,
+        load_only=["DIS", "BAS6"],
+        check=False,
+    )
+    dis    = mf.get_package("DIS")
+    bas    = mf.get_package("BAS6")
+    top    = dis.top.array.astype(float)
+    ibound = bas.ibound.array[0]
+    nrow, ncol = dis.nrow, dis.ncol
+    cell_size = float(dis.delr.array[0])
+
+    # ── Resolve outlet cell ───────────────────────────────────────────────────
+    try:
+        import geopandas as gpd
+        _has_gpd = True
+    except ImportError:
+        _has_gpd = False
+
+    if _has_gpd and hasattr(outlet_point, "geometry"):
+        pt = outlet_point.geometry.iloc[0].centroid
+        ox, oy = pt.x, pt.y
+
+        if mfgrid_path is None:
+            candidates = glob.glob(os.path.join(wd, "MFgrid*.shp")) or \
+                         glob.glob(os.path.join(wd, "*grid*.shp"))
+            mfgrid_path = candidates[0] if candidates else None
+
+        if mfgrid_path and os.path.isfile(str(mfgrid_path)):
+            grid_gdf = gpd.read_file(str(mfgrid_path))
+            col_map  = {c: c.lower() for c in grid_gdf.columns}
+            grid_gdf = grid_gdf.rename(columns=col_map)
+            pt_gdf   = gpd.GeoDataFrame(
+                geometry=[outlet_point.geometry.iloc[0]],
+                crs=outlet_point.crs,
+            ).to_crs(grid_gdf.crs)
+            joined = gpd.sjoin(
+                grid_gdf[["row", "col", "geometry"]],
+                pt_gdf, how="inner", predicate="intersects",
+            )
+            if joined.empty:
+                raise ValueError("Outlet point does not fall within any active grid cell.")
+            outlet_r0 = int(joined["row"].iloc[0]) - 1
+            outlet_c0 = int(joined["col"].iloc[0]) - 1
+        else:
+            xmin = float(getattr(dis, "xul", 0.0))
+            ymax = float(getattr(dis, "yul", nrow * cell_size))
+            outlet_c0 = int((ox - xmin) / cell_size)
+            outlet_r0 = int((ymax - oy) / cell_size)
+    elif isinstance(outlet_point, (tuple, list)) and len(outlet_point) == 2:
+        a, b = outlet_point
+        if isinstance(a, float) and a > 1000:
+            xmin = float(getattr(dis, "xul", 0.0))
+            ymax = float(getattr(dis, "yul", nrow * cell_size))
+            outlet_c0 = int((a - xmin) / cell_size)
+            outlet_r0 = int((ymax - b) / cell_size)
+        else:
+            outlet_r0, outlet_c0 = int(a) - 1, int(b) - 1
+    else:
+        raise TypeError(
+            "outlet_point must be a GeoDataFrame, (x, y) coordinate tuple, "
+            "or (row, col) index tuple."
+        )
+
+    print(f"  Outlet cell: row={outlet_r0+1}  col={outlet_c0+1}  "
+          f"top={top[outlet_r0, outlet_c0]:.2f} m")
+
+    # ── Build distance-from-outlet grid ──────────────────────────────────────
+    rows_idx = np.arange(nrow)
+    cols_idx = np.arange(ncol)
+    C, R     = np.meshgrid(cols_idx, rows_idx)
+    dist     = np.sqrt((R - outlet_r0)**2 + (C - outlet_c0)**2) * cell_size  # metres
+
+    # ── Determine head at outlet and gradient ─────────────────────────────────
+    outlet_top = float(top[outlet_r0, outlet_c0])
+    if head_at_outlet is None:
+        head_at_outlet = outlet_top - head_offset_at_outlet
+        print(f"  DEM elevation at outlet : {outlet_top:.2f} m")
+        print(f"  Head at outlet (DEM − {head_offset_at_outlet} m) : {head_at_outlet:.2f} m")
+
+    if gradient is None:
+        # Estimate from fraction of topographic relief over the domain extent
+        active_top = np.where(ibound > 0, top, np.nan)
+        relief     = float(np.nanmax(active_top) - np.nanmin(active_top))
+        head_range = fraction_of_relief * relief
+        max_dist   = float(np.nanmax(dist[ibound > 0]))
+        gradient   = head_range / max_dist if max_dist > 0 else 0.001
+        print(f"  Topographic relief : {relief:.1f} m")
+        print(f"  Head range applied : {head_range:.1f} m  "
+              f"({fraction_of_relief*100:.0f}% of relief)")
+        print(f"  Implied gradient   : {gradient*1000:.2f} m/km")
+
+    # ── Construct new head surface ────────────────────────────────────────────
+    strt_new = head_at_outlet + gradient * dist
+
+    # Cap heads at cell top (head cannot exceed land surface)
+    strt_new = np.minimum(strt_new, top)
+
+    # Inactive cells → 0 (MODFLOW ignores them)
+    strt_new = np.where(ibound > 0, strt_new, 0.0)
+
+    print(f"  Head at outlet     : {head_at_outlet:.2f} m")
+    print(f"  Head range (active): {float(np.nanmin(np.where(ibound>0, strt_new, np.nan))):.1f}"
+          f" – {float(np.nanmax(np.where(ibound>0, strt_new, np.nan))):.1f} m")
+
+    # ── Write updated BAS6 file ───────────────────────────────────────────────
+    bas_new = flopy.modflow.ModflowBas(
+        mf,
+        ibound=bas.ibound.array,
+        strt=strt_new[np.newaxis, :, :],   # shape (nlay, nrow, ncol)
+    )
+    bas_new.write_file()
+    bas_files = glob.glob(os.path.join(wd, "*.bas"))
+    if bas_files:
+        print(f"  BAS6 file updated  : {bas_files[0]}")
+
+    # ── Verification plot ─────────────────────────────────────────────────────
+    if plot:
+        from swatmf.outputs.modflow_diagnostics import plot_head_gradient_check
+        import matplotlib.pyplot as plt
+
+        fig = plot_head_gradient_check(
+            strt_new, wd,
+            outlet_rc=(outlet_r0, outlet_c0),
+        )
+        fig.suptitle(
+            f"Head gradient verification  |  gradient ≈ {gradient*1000:.2f} m/km  "
+            f"|  outlet head = {head_at_outlet:.1f} m",
+            fontsize=11, fontweight="bold",
+        )
+
+        if plot_path is None:
+            import matplotlib
+            if matplotlib.get_backend().lower() in ("agg", "pdf", "ps", "svg", "cairo"):
+                plot_path = os.path.join(wd, "head_gradient_check.png")
+
+        if plot_path is not None:
+            fig.savefig(str(plot_path), dpi=150, bbox_inches="tight")
+            print(f"  Gradient plot saved : {plot_path}")
+        else:
+            plt.show()
+
+        plt.close(fig)
+
+    return strt_new
+
+
+# ---------------------------------------------------------------------------
+# Drain burn-in to a single outlet point (DEM-based, retained for reference)
+# ---------------------------------------------------------------------------
+
+def burn_drain_to_point(
+    mf_folder: str | os.PathLike,
+    outlet_point,
+    *,
+    conductance: float = 500.0,
+    elev_offset: float = 0.5,
+    layer: int = 1,
+    min_accumulation: int = 3,
+    smooth_dem: bool = True,
+    mfgrid_path: str | os.PathLike | None = None,
+) -> str:
+    """Compute a D8 drainage network to *outlet_point* and burn it in as DRN.
+
+    No stream shapefile is required.  The function:
+
+    1. Loads the MODFLOW top (DEM) array.
+    2. Optionally smooths it to remove pits that would trap flow before the
+       outlet.
+    3. Runs a D8 steepest-descent flow-direction analysis.
+    4. Delineates all active cells that drain to the outlet cell via BFS.
+    5. Filters to cells with upstream-area ≥ *min_accumulation* cells (the
+       main channel, not every hillslope cell).
+    6. Writes a DRN file for those cells and regenerates ``modflow.mfn``.
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        MODFLOW model workspace.
+    outlet_point : GeoDataFrame, (x, y) tuple, or (row, col) tuple
+        The spring / drain outlet location.  If a GeoDataFrame the first
+        geometry's centroid is used.  Coordinates must be in the same CRS as
+        the MODFLOW grid.  Alternatively supply a ``(row, col)`` tuple of
+        1-based grid indices directly.
+    conductance : float
+        Drain conductance in m²/day applied to every channel cell.
+        Default 500 m²/day.
+    elev_offset : float
+        Drain elevation = cell top − *elev_offset* (m).  Default 0.5 m.
+    layer : int
+        MODFLOW layer (1-based).  Default 1.
+    min_accumulation : int
+        Minimum number of upstream cells for a cell to be included as a drain.
+        Raise this to restrict DRN to main channels only; set to 1 to drain
+        every cell upstream of the outlet.  Default 3.
+    smooth_dem : bool
+        If True, apply a 3×3 uniform filter to the top array before computing
+        flow directions.  This fills local pits that would otherwise capture
+        flow before it reaches the outlet.  Default True.
+    mfgrid_path : str or path-like, optional
+        Path to the MFgrid shapefile.  Searched automatically if omitted.
+
+    Returns
+    -------
+    str
+        Path to the written ``.drn`` file.
+    """
+    from scipy.ndimage import uniform_filter
+
+    wd = str(mf_folder)
+
+    # ── Locate model files ────────────────────────────────────────────────────
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    if not nam_files:
+        raise FileNotFoundError(f"No .nam file found in {wd}")
+
+    mf = flopy.modflow.Modflow.load(
+        os.path.basename(nam_files[0]),
+        model_ws=wd,
+        load_only=["DIS", "BAS6"],
+        check=False,
+    )
+    dis    = mf.get_package("DIS")
+    bas    = mf.get_package("BAS6")
+    top    = dis.top.array          # (nrow, ncol)
+    ibound = bas.ibound.array[0]    # (nrow, ncol)
+    nrow, ncol = dis.nrow, dis.ncol
+
+    # Infer cell size from DIS (assume uniform square cells)
+    cell_size = float(dis.delr.array[0])
+
+    # ── Resolve outlet cell ───────────────────────────────────────────────────
+    try:
+        import geopandas as gpd
+        _has_gpd = True
+    except ImportError:
+        _has_gpd = False
+
+    if _has_gpd and hasattr(outlet_point, "geometry"):
+        # GeoDataFrame — use first point centroid
+        pt = outlet_point.geometry.iloc[0].centroid
+        ox, oy = pt.x, pt.y
+
+        # Need grid origin to convert coords → row/col
+        if mfgrid_path is None:
+            candidates = glob.glob(os.path.join(wd, "MFgrid*.shp")) or \
+                         glob.glob(os.path.join(wd, "*grid*.shp"))
+            mfgrid_path = candidates[0] if candidates else None
+
+        if mfgrid_path and os.path.isfile(str(mfgrid_path)):
+            grid_gdf = gpd.read_file(str(mfgrid_path))
+            col_map  = {c: c.lower() for c in grid_gdf.columns}
+            grid_gdf = grid_gdf.rename(columns=col_map)
+            pt_gdf   = gpd.GeoDataFrame(
+                geometry=[outlet_point.geometry.iloc[0]],
+                crs=outlet_point.crs,
+            ).to_crs(grid_gdf.crs)
+            joined = gpd.sjoin(
+                grid_gdf[["row", "col", "geometry"]],
+                pt_gdf, how="inner", predicate="intersects",
+            )
+            if joined.empty:
+                raise ValueError("Outlet point does not fall within any active grid cell.")
+            outlet_r0 = int(joined["row"].iloc[0]) - 1   # 0-based
+            outlet_c0 = int(joined["col"].iloc[0]) - 1
+        else:
+            # Fall back: infer origin from DIS
+            xmin = float(dis.xul) if hasattr(dis, "xul") else 0.0
+            ymax = float(dis.yul) if hasattr(dis, "yul") else nrow * cell_size
+            outlet_c0 = int((ox - xmin) / cell_size)
+            outlet_r0 = int((ymax - oy) / cell_size)
+
+        print(f"  Outlet point ({ox:.1f}, {oy:.1f}) → row={outlet_r0+1}  col={outlet_c0+1}")
+
+    elif isinstance(outlet_point, (tuple, list)) and len(outlet_point) == 2:
+        first, second = outlet_point
+        if isinstance(first, float) and first > 1000:
+            # Treat as (x, y) coordinates
+            ox, oy = first, second
+            xmin = float(dis.xul) if hasattr(dis, "xul") else 0.0
+            ymax = float(dis.yul) if hasattr(dis, "yul") else nrow * cell_size
+            outlet_c0 = int((ox - xmin) / cell_size)
+            outlet_r0 = int((ymax - oy) / cell_size)
+        else:
+            # Treat as (row, col) — 1-based
+            outlet_r0 = int(first)  - 1
+            outlet_c0 = int(second) - 1
+        print(f"  Outlet cell: row={outlet_r0+1}  col={outlet_c0+1}")
+    else:
+        raise TypeError(
+            "outlet_point must be a GeoDataFrame, (x, y) coordinate tuple, "
+            "or (row, col) index tuple."
+        )
+
+    if not (0 <= outlet_r0 < nrow and 0 <= outlet_c0 < ncol):
+        raise ValueError(
+            f"Outlet cell ({outlet_r0+1}, {outlet_c0+1}) is outside the grid "
+            f"({nrow} rows × {ncol} cols)."
+        )
+
+    # ── Build DEM for flow routing (active cells only, NaN elsewhere) ─────────
+    dem = np.where(ibound > 0, top.astype(float), np.nan)
+
+    if smooth_dem:
+        # Fill NaN with local mean before smoothing so edges don't bleed
+        filled = np.where(np.isnan(dem), np.nanmean(dem), dem)
+        smoothed = uniform_filter(filled, size=3)
+        dem = np.where(np.isnan(dem), np.nan, smoothed)
+        print("  DEM smoothed (3×3 uniform filter) to reduce pit trapping")
+
+    # ── D8 flow directions ────────────────────────────────────────────────────
+    print("  Computing D8 flow directions ...")
+    fdir_dr, fdir_dc = _d8_flow_direction(dem)
+
+    # ── Delineate all upstream cells via BFS ──────────────────────────────────
+    print("  Delineating upstream drainage area ...")
+    upstream = _upstream_cells(fdir_dr, fdir_dc, outlet_r0, outlet_c0)
+    print(f"  Total cells draining to outlet: {len(upstream)}")
+
+    # ── Compute flow accumulation (upstream cell count) for each cell ─────────
+    # Simple O(n) pass: sort cells from high to low elevation, accumulate
+    acc = {rc: 1 for rc in upstream}
+    sorted_cells = sorted(upstream, key=lambda rc: -dem[rc[0], rc[1]]
+                          if np.isfinite(dem[rc[0], rc[1]]) else -1e9)
+    for r, c in sorted_cells:
+        dr, dc = int(fdir_dr[r, c]), int(fdir_dc[r, c])
+        if dr == -99:
+            continue
+        nr, nc = r + dr, c + dc
+        if (nr, nc) in acc:
+            acc[(nr, nc)] += acc[(r, c)]
+
+    # ── Filter to channel cells (accumulation ≥ threshold) ───────────────────
+    channel_cells = [(r, c) for (r, c), a in acc.items() if a >= min_accumulation]
+    print(f"  Channel cells (accumulation ≥ {min_accumulation}): {len(channel_cells)}")
+
+    if not channel_cells:
+        raise ValueError(
+            f"No channel cells found with min_accumulation={min_accumulation}. "
+            "Lower the threshold or check that the outlet is inside the active domain."
+        )
+
+    # Always include the outlet cell itself
+    if (outlet_r0, outlet_c0) not in {(r, c) for r, c in channel_cells}:
+        channel_cells.append((outlet_r0, outlet_c0))
+
+    # ── Build DRN records (1-based row/col) ───────────────────────────────────
+    drn_records = []
+    for r0, c0 in channel_cells:
+        elev = float(top[r0, c0]) - elev_offset
+        drn_records.append((r0 + 1, c0 + 1, elev, conductance))
+
+    print(f"  DRN records to write: {len(drn_records)}")
+
+    # ── Write DRN file, update .nam, regenerate modflow.mfn + OC ─────────────
+    drn_path = _write_drn_and_update_nam(wd, nam_files[0], drn_records, layer)
+    create_modflow_mfn(wd)
+    modify_modflow_oc(wd)
+
+    print(f"  DRN file written    : {drn_path}")
+    print(f"  modflow.mfn updated : {os.path.join(wd, 'modflow.mfn')}")
+    return drn_path
+
+
+# ---------------------------------------------------------------------------
+# Stream drain burn-in (from shapefile)
+# ---------------------------------------------------------------------------
+
+def burn_stream_drains(
+    mf_folder: str | os.PathLike,
+    stream_path: "str | os.PathLike | gpd.GeoDataFrame",
+    *,
+    conductance: float = 500.0,
+    elev_offset: float = 0.5,
+    layer: int = 1,
+    mfgrid_path: str | os.PathLike | None = None,
+    spring_points: "gpd.GeoDataFrame | None" = None,
+    spring_conductance: float = 100.0,
+    spring_elev_offset: float = 0.5,
+) -> str:
+    """Burn stream-network drains into the MODFLOW model.
+
+    Analogous to DEM stream-burning in SWAT: every MODFLOW cell that the
+    stream polylines cross receives a Drain (DRN) entry.  When the simulated
+    head exceeds the drain elevation the cell discharges to the surface,
+    drawing groundwater toward the valley floor regardless of the initial-head
+    configuration.
+
+    An optional ``spring_points`` argument lets you combine the stream-network
+    burn-in with one or more point spring outlets in a single DRN file.
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        MODFLOW model workspace (contains ``.dis``, ``.nam``, ``modflow.mfn``).
+    stream_path : str, path-like, or GeoDataFrame
+        Stream network polylines.  Must be in the same CRS as the MODFLOW
+        grid (EPSG:2193 for NZTM).  Accepted formats: any file readable by
+        ``geopandas.read_file`` or an already-loaded GeoDataFrame.
+    conductance : float, optional
+        Streambed drain conductance in m²/d applied to every stream cell.
+        Higher values → stronger hydraulic connection.  Default 500 m²/d.
+    elev_offset : float, optional
+        Subtract this from the cell top elevation to set the drain elevation
+        (i.e. the drain sits *elev_offset* metres below the land surface).
+        Default 0.5 m.
+    layer : int, optional
+        MODFLOW layer that receives the drain cells.  Default 1 (top layer).
+    mfgrid_path : str or path-like, optional
+        Path to ``MFgrid.shp`` (MODFLOW cell polygon grid).  If omitted the
+        function looks for ``MFgrid.shp`` in *mf_folder*.
+    spring_points : GeoDataFrame, optional
+        Additional point spring locations merged into the same DRN file.
+    spring_conductance : float, optional
+        Conductance for the spring point drains.  Default 100 m²/d.
+    spring_elev_offset : float, optional
+        Drain elevation offset (below land surface) for spring points.
+        Default 0.5 m.
+
+    Returns
+    -------
+    str
+        Path to the written ``.drn`` file.
+    """
+    import geopandas as gpd
+    from shapely.geometry import Point
+
+    wd = str(mf_folder)
+
+    # ── Locate model files ────────────────────────────────────────────────────
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    if not nam_files:
+        raise FileNotFoundError(f"No .nam file found in {wd}")
+
+    dis_files = glob.glob(os.path.join(wd, "*.dis"))
+    if not dis_files:
+        raise FileNotFoundError(f"No .dis file found in {wd}")
+
+    # ── Load MODFLOW grid shapefile ───────────────────────────────────────────
+    if mfgrid_path is None:
+        candidates = glob.glob(os.path.join(wd, "MFgrid*.shp")) or \
+                     glob.glob(os.path.join(wd, "*grid*.shp"))
+        if not candidates:
+            raise FileNotFoundError(
+                "MFgrid.shp not found — pass mfgrid_path explicitly."
+            )
+        mfgrid_path = candidates[0]
+
+    grid_gdf = gpd.read_file(mfgrid_path)
+    print(f"  Grid: {len(grid_gdf)} cells from {os.path.basename(str(mfgrid_path))}")
+
+    # Standardise row/col column names (case-insensitive)
+    col_map = {c: c.lower() for c in grid_gdf.columns}
+    grid_gdf = grid_gdf.rename(columns=col_map)
+
+    # ── Load MODFLOW DIS for cell-top elevations ──────────────────────────────
+    mf = flopy.modflow.Modflow.load(
+        os.path.basename(nam_files[0]),
+        model_ws=wd,
+        load_only=["DIS", "BAS6"],
+        check=False,
+    )
+    dis  = mf.get_package("DIS")
+    top_arr = dis.top.array          # shape (nrow, ncol)
+
+    # ── Load stream network ───────────────────────────────────────────────────
+    if isinstance(stream_path, gpd.GeoDataFrame):
+        streams = stream_path.copy()
+    else:
+        streams = gpd.read_file(str(stream_path))
+    print(f"  Streams: {len(streams)} features")
+
+    # Ensure CRS matches
+    if grid_gdf.crs is not None and streams.crs is not None:
+        if grid_gdf.crs != streams.crs:
+            streams = streams.to_crs(grid_gdf.crs)
+
+    # ── Intersect streams with grid cells ─────────────────────────────────────
+    stream_cells = gpd.sjoin(
+        grid_gdf[["row", "col", "geometry"]],
+        streams[["geometry"]],
+        how="inner",
+        predicate="intersects",
+    ).drop_duplicates(subset=["row", "col"])
+
+    print(f"  Stream cells identified: {len(stream_cells)}")
+    if len(stream_cells) == 0:
+        raise ValueError(
+            "No grid cells intersect the stream network — check CRS alignment."
+        )
+
+    # ── Build DRN records from stream cells ───────────────────────────────────
+    drn_records: list = []
+    for _, cell in stream_cells.iterrows():
+        r = int(cell["row"])
+        c = int(cell["col"])
+        elev = float(top_arr[r - 1, c - 1]) - elev_offset
+        drn_records.append((r, c, elev, conductance))
+
+    # ── Optionally add spring point drains ────────────────────────────────────
+    if spring_points is not None:
+        if isinstance(spring_points, gpd.GeoDataFrame):
+            pts = spring_points.copy()
+        else:
+            pts = gpd.GeoDataFrame(
+                spring_points,
+                geometry=gpd.points_from_xy(
+                    spring_points["x"], spring_points["y"]
+                ),
+                crs=grid_gdf.crs,
+            )
+
+        if grid_gdf.crs is not None and pts.crs is not None:
+            if pts.crs != grid_gdf.crs:
+                pts = pts.to_crs(grid_gdf.crs)
+
+        pt_cells = gpd.sjoin(
+            grid_gdf[["row", "col", "geometry"]],
+            pts[["geometry"]],
+            how="inner",
+            predicate="intersects",
+        ).drop_duplicates(subset=["row", "col"])
+
+        existing_rc = {(r["row"], r["col"]) for _, r in stream_cells.iterrows()}
+        for _, cell in pt_cells.iterrows():
+            r, c = int(cell["row"]), int(cell["col"])
+            if (r, c) not in existing_rc:
+                elev = float(top_arr[r - 1, c - 1]) - spring_elev_offset
+                drn_records.append((r, c, elev, spring_conductance))
+                print(f"  Spring point added: row={r}  col={c}  "
+                      f"drain_elev={elev:.2f} m  conductance={spring_conductance:.1f} m²/d")
+
+    print(f"  Total DRN cells: {len(drn_records)}")
+
+    # ── Write DRN file and update .nam ────────────────────────────────────────
+    drn_path = _write_drn_and_update_nam(wd, nam_files[0], drn_records, layer)
+
+    # ── Regenerate modflow.mfn and re-apply OC unit bump ─────────────────────
+    create_modflow_mfn(wd)
+    modify_modflow_oc(wd)
+
+    print(f"  DRN file written    : {drn_path}")
+    print(f"  modflow.mfn updated : {os.path.join(wd, 'modflow.mfn')}")
+    return drn_path
+
+
+# ---------------------------------------------------------------------------
+# Spring / drain outlet
+# ---------------------------------------------------------------------------
+
+def add_spring_drain(
+    mf_folder: str | os.PathLike,
+    spring_points: "gpd.GeoDataFrame | pd.DataFrame",
+    *,
+    conductance: float = 100.0,
+    elev_col: str | None = None,
+    elev_offset: float = 0.0,
+    layer: int = 1,
+    mfgrid_path: str | os.PathLike | None = None,
+) -> str:
+    """Add a MODFLOW Drain (DRN) package representing one or more springs.
+
+    Springs discharge groundwater to the surface only when the simulated head
+    exceeds the drain (spring orifice) elevation.  This is more physically
+    correct than a Constant Head cell, which can inject water, and more
+    appropriate than a River cell, which implies a surface-water body.
+
+    When ``drain_cells = True`` is set in ``swatmf_link.txt`` the SWAT-MODFLOW
+    executable routes all DRN discharge to SWAT subbasin channels, so each
+    spring automatically becomes a GW→SW flux in the coupled model.
+
+    Parameters
+    ----------
+    mf_folder : str or path-like
+        MODFLOW model folder (the folder containing ``.dis``, ``.nam`` etc.).
+        The ``.drn`` file is written here and ``modflow.mfn`` is regenerated
+        so the new package is included in the next model run.
+    spring_points : GeoDataFrame or DataFrame
+        Point locations of the spring(s).  Accepted forms:
+
+        * **GeoDataFrame** with point geometry (any CRS — reprojected to match
+          the grid if needed).  The grid cell containing each point is found
+          by a spatial join with ``mf_grid.gpkg``.
+        * **DataFrame** with columns ``row`` and ``col`` (1-based, matching
+          the MODFLOW convention) if you already know the cell indices.
+
+    conductance : float, optional
+        Drain conductance [L²/T] applied to all spring cells.  Controls how
+        rapidly discharge responds to head above the drain elevation.  Higher
+        values produce a more responsive spring; lower values damp the
+        response.  A value of 100 m²/day is a reasonable starting point for
+        a high-flow spring.  Default ``100.0``.
+    elev_col : str or None, optional
+        Column in *spring_points* containing the drain (spring orifice)
+        elevation [m].  If ``None`` (default) the land-surface elevation
+        (``top_elev`` from ``mf_grid.gpkg``, or the DIS ``top`` array) is
+        used, minus *elev_offset*.
+    elev_offset : float, optional
+        Subtracted from the drain elevation when *elev_col* is ``None``.
+        A small positive value (e.g. ``0.5``) lowers the effective drain
+        threshold slightly so discharge begins before the water table reaches
+        the exact surface.  Default ``0.0``.
+    layer : int, optional
+        MODFLOW layer number for the drain cells (1-based).  Default ``1``.
+    mfgrid_path : str, path-like, or None, optional
+        Path to ``mf_grid.gpkg``.  Required when *spring_points* is a
+        GeoDataFrame.  If ``None``, the function searches *mf_folder* and its
+        parent ``GIS/org_shps/`` for ``mf_grid.gpkg``.
+
+    Returns
+    -------
+    str
+        Absolute path to the written ``.drn`` file.
+
+    Examples
+    --------
+    From a point shapefile of spring locations:
+
+    >>> import geopandas as gpd
+    >>> from swatmf.preprocessing.modflow import add_spring_drain
+    >>>
+    >>> springs = gpd.read_file("GIS/org_shps/springs.shp")
+    >>> drn_path = add_spring_drain(
+    ...     mf_folder    = run_dir,
+    ...     spring_points = springs,
+    ...     conductance  = 200.0,   # high-flow spring
+    ...     elev_offset  = 0.5,     # drain 0.5 m below surface
+    ...     mfgrid_path  = "GIS/org_shps/mf_grid.gpkg",
+    ... )
+    >>> print("DRN written to:", drn_path)
+
+    From known row/col indices (no shapefile needed):
+
+    >>> import pandas as pd
+    >>> springs_rc = pd.DataFrame({"row": [34], "col": [187]})
+    >>> drn_path = add_spring_drain(run_dir, springs_rc, conductance=100.0)
+    """
+    try:
+        import geopandas as gpd_mod
+    except ImportError:
+        gpd_mod = None
+
+    wd = str(mf_folder)
+
+    # ── Load MODFLOW model to get top elevations and grid dims ────────────────
+    nam_files = glob.glob(os.path.join(wd, "*.nam"))
+    if not nam_files:
+        raise FileNotFoundError(f"No .nam file found in {wd!r}")
+
+    import flopy
+    import flopy.modflow as fm
+    mf = flopy.modflow.Modflow.load(
+        os.path.basename(nam_files[0]),
+        model_ws=wd,
+        check=False,
+        verbose=False,
+    )
+    dis_pkg = mf.get_package("DIS")
+    top_arr = dis_pkg.top.array     # (nrow, ncol) land-surface elevation
+    nrow, ncol = dis_pkg.nrow, dis_pkg.ncol
+
+    # ── Resolve spring cell locations ─────────────────────────────────────────
+    has_geo = (
+        gpd_mod is not None
+        and hasattr(spring_points, "geometry")
+        and spring_points.geometry is not None
+    )
+
+    if has_geo:
+        # Spatial join: find which mf_grid cell each spring falls in
+        grid_path = mfgrid_path
+        if grid_path is None:
+            candidates = [
+                os.path.join(wd, "mf_grid.gpkg"),
+                os.path.join(os.path.dirname(wd), "GIS", "org_shps", "mf_grid.gpkg"),
+                os.path.join(wd, "GIS", "org_shps", "mf_grid.gpkg"),
+            ]
+            for c in candidates:
+                if os.path.isfile(c):
+                    grid_path = c
+                    break
+        if grid_path is None or not os.path.isfile(str(grid_path)):
+            raise FileNotFoundError(
+                "mf_grid.gpkg not found.  Supply mfgrid_path= explicitly."
+            )
+
+        grid_gdf = gpd_mod.read_file(str(grid_path))
+        pts = spring_points.copy()
+        if pts.crs is not None and pts.crs != grid_gdf.crs:
+            pts = pts.to_crs(grid_gdf.crs)
+
+        joined = gpd_mod.sjoin(
+            pts,
+            grid_gdf[["grid_id", "row", "col", "top_elev", "geometry"]],
+            how="left",
+            predicate="within",
+        )
+        missing = joined["row"].isna().sum()
+        if missing:
+            import warnings
+            warnings.warn(
+                f"{missing} spring point(s) did not fall within any active grid cell "
+                "and will be skipped.",
+                stacklevel=2,
+            )
+        joined = joined.dropna(subset=["row", "col"]).copy()
+        joined["row"] = joined["row"].astype(int)
+        joined["col"] = joined["col"].astype(int)
+
+        rows = joined["row"].tolist()
+        cols = joined["col"].tolist()
+        top_elevs = joined["top_elev"].tolist()
+
+        if elev_col and elev_col in joined.columns:
+            drain_elevs = joined[elev_col].tolist()
+        else:
+            drain_elevs = [e - elev_offset for e in top_elevs]
+
+    else:
+        # DataFrame with row/col columns (1-based)
+        import pandas as _pd
+        df = spring_points if isinstance(spring_points, _pd.DataFrame) else _pd.DataFrame(spring_points)
+        rows = df["row"].astype(int).tolist()
+        cols = df["col"].astype(int).tolist()
+
+        if elev_col and elev_col in df.columns:
+            drain_elevs = df[elev_col].tolist()
+        else:
+            drain_elevs = [
+                float(top_arr[r - 1, c - 1]) - elev_offset
+                for r, c in zip(rows, cols)
+            ]
+
+    if not rows:
+        raise ValueError("No valid spring cells found — check spring_points geometry and grid overlap.")
+
+    print(f"  Adding {len(rows)} spring drain cell(s):")
+    for r, c, elev in zip(rows, cols, drain_elevs):
+        print(f"    row={r}  col={c}  drain_elev={elev:.2f} m  conductance={conductance:.1f} m2/d")
+
+    drn_records = [(r, c, elev, conductance) for r, c, elev in zip(rows, cols, drain_elevs)]
+    drn_path = _write_drn_and_update_nam(wd, nam_files[0], drn_records, layer)
+
+    create_modflow_mfn(wd)
+    modify_modflow_oc(wd)
+
+    print(f"  DRN file written    : {drn_path}")
+    print(f"  modflow.mfn updated : {os.path.join(wd, 'modflow.mfn')}")
+    print()
+    print("  Next steps:")
+    print("  1. Re-run the standalone MODFLOW QA (Section 2.8) to verify spring discharge")
+    print("  2. Set cfg.drain_cells = True in swatmf_link.txt (Section 3.1)")
+    print("     so SWAT-MODFLOW routes spring discharge to SWAT subbasin channels")
+
+    return drn_path
+
+
+# ---------------------------------------------------------------------------
 # Build a complete MODFLOW model from a DEM raster (Scenario C)
 # ---------------------------------------------------------------------------
 
@@ -1379,6 +2724,7 @@ def build_mf_model_from_dem(
     aquifer_thickness: Union[float, str, os.PathLike] = 30.0,
     sy: Union[float, str, os.PathLike] = 0.2,
     initial_head: Union[float, str, os.PathLike, None] = None,
+    water_table_depth: Union[float, str, os.PathLike, None] = None,
     head_depth: float = 2.0,
     hk: float = 5.0,
     ss: float = 1e-4,
@@ -1426,12 +2772,22 @@ def build_mf_model_from_dem(
         Specific yield [dimensionless].  Scalar or raster path.  Default
         ``0.2``.
     initial_head : float, path-like, or None, optional
-        Initial hydraulic head [same units as DEM].  Scalar or raster path.
-        If ``None`` (default), the head is set to ``top_elev - head_depth``
-        for valid (non-nodata) cells; nodata cells remain masked.
+        Initial hydraulic head [same units as DEM].  Scalar or raster path
+        (e.g. a GeoTIFF of observed/modelled piezometric surface).  When
+        provided this takes priority over *water_table_depth* and *head_depth*.
+        If ``None`` (default), head is derived from *water_table_depth* or
+        *head_depth*.
+    water_table_depth : float, path-like, or None, optional
+        Depth to the water table below the land surface [same units as DEM].
+        Scalar or raster path (e.g. a GeoTIFF of water-table depth).  When
+        provided, ``initial_head = top_elev - water_table_depth`` is computed
+        cell-by-cell after resampling to the model grid.  Ignored when
+        *initial_head* is not ``None``.  If both *water_table_depth* and
+        *initial_head* are ``None``, the scalar *head_depth* is used instead.
     head_depth : float, optional
-        Depth below the land surface used to compute the default initial head
-        when *initial_head* is ``None``.  Default ``2.0`` [same units as DEM].
+        Fallback scalar depth below the land surface used to compute the
+        default initial head when both *initial_head* and *water_table_depth*
+        are ``None``.  Default ``2.0`` [same units as DEM].
     hk : float, optional
         Horizontal hydraulic conductivity [length/time].  Scalar only.
         Default ``5.0``.
@@ -1490,6 +2846,24 @@ def build_mf_model_from_dem(
     ...     crs         = "EPSG:32632",
     ...     output_dir  = paths.sm_shps,
     ...     sim_duration = sim_period + 100,
+    ... )
+
+    Supplying a hydraulic head raster directly (e.g. from a regional model):
+
+    >>> result = build_mf_model_from_dem(
+    ...     dem_path     = "GIS/dem.tif",
+    ...     mf_folder    = wd,
+    ...     mf_name      = "mymodel",
+    ...     initial_head = "GIS/gw_head.tif",   # piezometric surface raster
+    ... )
+
+    Supplying a water-table depth raster (head = DEM − depth):
+
+    >>> result = build_mf_model_from_dem(
+    ...     dem_path           = "GIS/dem.tif",
+    ...     mf_folder          = wd,
+    ...     mf_name            = "mymodel",
+    ...     water_table_depth  = "GIS/wt_depth.tif",  # depth-to-WT raster
     ... )
     >>> print("mf_grid written to:", result.grid_path)
     >>> print(f"Grid: {result.nrow} rows × {result.ncol} cols")
@@ -1611,10 +2985,16 @@ def build_mf_model_from_dem(
 
     sy_arr = _resolve(sy)
 
-    if initial_head is None:
-        head_arr: np.ndarray = np.where(valid, top_elev - head_depth, nodata)
+    if initial_head is not None:
+        # Explicit head raster or scalar — highest priority
+        head_arr: np.ndarray = _resolve(initial_head)
+    elif water_table_depth is not None:
+        # Depth-to-WT raster or scalar: head = top - depth, cell by cell
+        depth_arr = _resolve(water_table_depth)
+        head_arr = np.where(valid, top_elev - depth_arr, nodata)
     else:
-        head_arr = _resolve(initial_head)
+        # Fallback: uniform scalar depth below land surface
+        head_arr = np.where(valid, top_elev - head_depth, nodata)
 
     ibound = np.where(valid, 1, 0).astype(np.int32)
 
