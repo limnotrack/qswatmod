@@ -22,6 +22,7 @@ outputs/groundwater          : read & visualise swatmf_out_MF_obs
 outputs/recharge             : read swatmf_out_MF_recharge* files
 outputs/gwsw                 : read swatmf_out_MF_gwsw* files
 outputs/water_balance        : read output.std
+epm                          : EPM transit-time lag correction (Rotorua catchment)
 """
 
 __version__ = "0.1.0"
@@ -31,5 +32,20 @@ _EXPORT_VERSION = "version 2.10.1."
 from .paths import Paths
 from .sim_period import parse_file_cio
 from .simulation import validate_simulation, run_simulation_monitored
+from .epm import (
+    EPMParams, ROTORUA_EPM,
+    epm_kernel, binary_epm_kernel,
+    apply_epm_lag, apply_epm_lag_df, apply_epm_lag_spatial,
+    lag_rivflux, lag_recharge_conc,
+    assign_stream_params, kernel_summary, plot_kernel,
+    compare_epm_vs_rt3d, epm_coverage_fraction,
+)
 
-__all__ = ["Paths", "parse_file_cio", "validate_simulation", "run_simulation_monitored"]
+__all__ = [
+    "Paths", "parse_file_cio", "validate_simulation", "run_simulation_monitored",
+    "EPMParams", "ROTORUA_EPM",
+    "epm_kernel", "binary_epm_kernel",
+    "apply_epm_lag", "apply_epm_lag_df", "apply_epm_lag_spatial",
+    "lag_rivflux", "lag_recharge_conc",
+    "assign_stream_params", "kernel_summary", "plot_kernel",
+]
