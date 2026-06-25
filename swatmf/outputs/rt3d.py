@@ -109,10 +109,16 @@ def read_rt3d_conc(
                     grids.append(current_grid)
                 current_grid = []
                 dates.append(stripped.split()[1])
+            elif stripped.lower().startswith("layer:"):
+                # Layer separator line — skip (multi-layer output)
+                continue
             else:
-                # Grid data row
-                vals = [float(v) for v in stripped.split()]
-                current_grid.append(vals)
+                # Grid data row — skip any non-numeric lines gracefully
+                try:
+                    vals = [float(v) for v in stripped.split()]
+                    current_grid.append(vals)
+                except ValueError:
+                    continue
 
     # Don't forget the last grid
     if current_grid:
@@ -176,25 +182,67 @@ def read_rt3d_rivflux(
             f"RT3D river flux file not found: {path}"
         )
 
-    # Read all numeric rows (skip header lines starting with text)
-    rows = []
+    # Parse block-by-block: each "Day: N" line starts a new time step.
+    # subbasin format: layer, subbasin_id, river_flux, drain_flux  (4 cols)
+    #   — but some versions write: subbasin_id, river_flux, drain_flux (3 cols)
+    # grid format:     layer, row, col, flux  (4 cols)
+    days: list[int] = []
+    # Each entry: dict of {id: value} for one time step
+    blocks: list[dict] = []
+    current: dict = {}
+
     with open(path, "r") as f:
         for line in f:
             stripped = line.strip()
             if not stripped:
                 continue
-            # Try parsing as numbers
+            low = stripped.lower()
+            if low.startswith("day:"):
+                if current:
+                    blocks.append(current)
+                current = {}
+                try:
+                    days.append(int(stripped.split()[1]))
+                except (IndexError, ValueError):
+                    pass
+                continue
+            # Skip all-text header / label lines
             try:
-                vals = [float(v) for v in stripped.split()]
-                rows.append(vals)
+                parts = stripped.split()
+                vals = [float(v) for v in parts]
             except ValueError:
                 continue
 
-    df = pd.DataFrame(rows)
-    if start_date:
+            if by == "subbasin":
+                # Format A: subbasin_id  river_flux  drain_flux  (3 cols)
+                # Format B: layer  subbasin_id  river_flux  drain_flux (4 cols)
+                if len(vals) == 3:
+                    sub_id, river_flux = int(vals[0]), vals[1]
+                elif len(vals) >= 4:
+                    sub_id, river_flux = int(vals[1]), vals[2]
+                else:
+                    continue
+                current[sub_id] = river_flux
+            else:
+                # grid: layer  row  col  flux
+                if len(vals) >= 4:
+                    grid_id = (int(vals[0]), int(vals[1]), int(vals[2]))
+                    current[grid_id] = vals[3]
+
+    if current:
+        blocks.append(current)
+
+    df = pd.DataFrame(blocks)
+    df = df.sort_index(axis=1)
+
+    if by == "subbasin":
+        df.columns = [f"sub_{c}" for c in df.columns]
+    else:
+        df.columns = [f"L{c[0]}_R{c[1]}_C{c[2]}" for c in df.columns]
+
+    if start_date and len(df) > 0:
         df.index = pd.date_range(start_date, periods=len(df), freq="D")
-    df.columns = [f"cell_{i+1}" if by == "grid" else f"sub_{i+1}"
-                  for i in range(df.shape[1])]
+
     return df
 
 
@@ -233,23 +281,38 @@ def read_rt3d_recharge_conc(
             f"RT3D recharge file not found: {path}"
         )
 
-    rows = []
+    # Parse block-by-block: each "for day X year Y" line starts a new time step.
+    # subbasin file: one scalar value per line (one HRU per line)
+    # grid file: multiple values per line (flat rows of the grid)
+    blocks: list[list[float]] = []
+    current: list[float] = []
+
     with open(path, "r") as f:
         for line in f:
             stripped = line.strip()
             if not stripped:
                 continue
+            if "for day" in stripped and "year" in stripped:
+                if current:
+                    blocks.append(current)
+                current = []
+                continue
             try:
                 vals = [float(v) for v in stripped.split()]
-                rows.append(vals)
+                current.extend(vals)
             except ValueError:
                 continue
 
-    df = pd.DataFrame(rows)
-    if start_date:
-        df.index = pd.date_range(start_date, periods=len(df), freq="D")
-    df.columns = [f"cell_{i+1}" if by == "grid" else f"sub_{i+1}"
+    if current:
+        blocks.append(current)
+
+    df = pd.DataFrame(blocks)
+    df.columns = [f"cell_{i+1}" if by == "grid" else f"hru_{i+1}"
                   for i in range(df.shape[1])]
+
+    if start_date and len(df) > 0:
+        df.index = pd.date_range(start_date, periods=len(df), freq="D")
+
     return df
 
 
