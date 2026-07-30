@@ -1,0 +1,1760 @@
+---
+title: "SWAT-MODFLOW Scripted Workflow"
+subtitle: "Using the `swatmf` Python package"
+author: ""
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    fig-width: 12
+    fig-height: 4
+    embed-resources: true
+jupyter: python3
+---
+
+## Introduction
+
+This document walks through a complete scripted workflow for
+[SWAT-MODFLOW](https://swat.tamu.edu/software/swat-modflow/) that mirrors
+the **QSWATMOD2** QGIS plugin tabs, but runs entirely in Python — no QGIS
+installation required.
+
+The workflow uses **Scenario C** (build MODFLOW from scratch) to create a
+fully working example in `data/qswatmod-test/` from the QSWAT model data in
+`data/swat/`.  The resulting folder structure mirrors what the QGIS plugin
+produces in `data/SWAT-MODFLOW/`.
+
+The workflow is implemented in the `swatmf` package bundled with this
+repository.  Install it (once) from the project root:
+
+```bash
+pip install -e .
+```
+
+The sections below follow the same tabs as the QSWATMOD2 plugin:
+
+| # | Section | Plugin tab |
+|---|---------|-----------|
+| 1 | Setup — paths and simulation period | *(common)* |
+| 2 | **Pre-Processing** — SWAT inputs, MODFLOW options, river connections, linking, RT3D | Pre-Processing |
+| 3 | **Simulation** — pumping, drain cells, groundwater delay | Simulation |
+| 4 | Streamflow | Post-Processing |
+| 5 | Groundwater Levels | Post-Processing |
+| 6 | MODFLOW Recharge | Post-Processing |
+| 7 | GW–SW Exchange | Post-Processing |
+| 8 | Water Balance | Post-Processing |
+| 9 | **RT3D** — Reactive Transport (NO₃, P) | Post-Processing |
+| 10 | Performance Metrics Summary | *(summary)* |
+
+---
+
+## 1  Setup
+
+### 1.1  Project paths
+
+The example data bundled with this repository lives under `data/`.  The QGIS plugin (QSWATMOD2) creates a standard project folder that contains
+all of the data needed for the coupled model.  The layout it produces is:
+
+| Variable | Points to | Contains |
+|----------|-----------|---------|
+| `project_dir` / `wd` | Project root (= SWAT TxtInOut) | `file.cio`, `*.hru`, `*.gw`, `output.*` … |
+| `org_shps` | `GIS/org_shps/` | `hru_org.shp`, `sub_org.shp`, `riv_org.shp`, `mf_grid.gpkg`, MODFLOW rasters |
+| `sm_shps` | `GIS/SMshps/` | `hru_link.gpkg`, `sub_link.gpkg`, `dhru_grid_link.gpkg`, `river_grid.shp` … |
+| `table_dir` | `GIS/Table/` | `hru_dhru`, `dhru_grid`, `river_grid`, `swatmf_link.txt` |
+| `exe_dir` | `SM_exes/` | `SWAT-MODFLOW3.exe`, `swatmf_rel*.exe`, `CreateSWATMF.exe` |
+| `run_dir` | `SWAT-MODFLOW/` | Coupled run folder — SWAT files + MODFLOW files assembled here |
+| `mf_wd` | MODFLOW model folder | `.dis`, `.bas`, `.nam`, `.nwt`, `.upw`, `.riv`, `.oc` … |
+
+`mf_wd` is the folder that holds the MODFLOW input files.  In many projects
+the MODFLOW files are placed directly in `run_dir` (the coupled run folder)
+or kept in a separate user-supplied directory.
+
+```{python}
+import os
+import matplotlib.pyplot as plt
+
+# ── PROJ conflict fix ───────────────────────────────────────────────────────
+# TauDEM ships an older PROJ database that can shadow rasterio's bundled one.
+# Force PROJ_DATA to rasterio's own proj_data directory before any imports
+# that touch PROJ (rasterio, geopandas, pyproj …).
+import rasterio as _rasterio
+os.environ["PROJ_DATA"] = os.path.join(
+    os.path.dirname(_rasterio.__file__), "proj_data"
+)
+# ────────────────────────────────────────────────────────────────────────────
+
+REPO_DIR = os.path.dirname(os.path.abspath("workflow.qmd"))
+
+# ── Source data (QSWAT project) ─────────────────────────────────────────────
+# Root of the QSWAT project that contains the SWAT TxtInOut and shapefiles.
+swat_project = os.path.join(REPO_DIR, "data", "swat")
+
+# SWAT TxtInOut folder inside the QSWAT project.
+swat_txtinout = os.path.join(swat_project, "Scenarios", "Default", "TxtInOut")
+
+# SWAT watershed shapefiles (HRU, subbasin, river).
+swat_shapes = os.path.join(swat_project, "Watershed", "Shapes")
+
+# DEM raster — used by Scenario C to build the MODFLOW model from scratch.
+dem_path = os.path.join(swat_project, "Source", "dem.tif")
+
+# ── Target project folder (qswatmod-test) ───────────────────────────────────
+# This is the QSWATMOD2-style project folder that this workflow will create.
+project_dir = os.path.join(REPO_DIR, "data", "qswatmod-test")
+
+# SWAT TxtInOut = the project root (SWAT files are copied here in Section 1.3).
+wd = project_dir
+
+# GIS subfolder structure (mirrors the QGIS plugin layout).
+gis_dir   = os.path.join(project_dir, "GIS")
+org_shps  = os.path.join(gis_dir, "org_shps")   # original shapefiles, MODFLOW rasters, mf_grid.gpkg
+sm_shps   = os.path.join(gis_dir, "SMshps")      # linkage shapefiles
+table_dir = os.path.join(gis_dir, "Table")       # link tables + swatmf_link.txt
+
+# Executables folder.
+exe_dir = os.path.join(project_dir, "SM_exes")
+
+# Coupled run folder — SWAT + MODFLOW files assembled here for the simulation.
+run_dir = os.path.join(project_dir, "SWAT-MODFLOW")
+
+# mf_wd will be set to the MODFLOW folder in Section 2.2 (Scenario C).
+# For Scenarios A/B it would point to an existing model folder.
+mf_wd = run_dir   # placeholder — overwritten in Scenario C
+
+# Output folder for exported results.
+out = os.path.join(REPO_DIR, "outputs")
+os.makedirs(out, exist_ok=True)
+# ────────────────────────────────────────────────────────────────────────────
+
+print("SWAT source TxtInOut  :", swat_txtinout)
+print("Project folder        :", project_dir)
+print("GIS / org_shps        :", org_shps)
+print("GIS / Table           :", table_dir)
+print("Coupled run folder    :", run_dir)
+```
+
+### 1.2  Project Setup
+
+Create the QSWATMOD2-style folder structure in `data/qswatmod-test/` and
+populate it with the SWAT TxtInOut files and shapefiles from `data/swat/`.
+This step is only needed once — it is safe to re-run (files are overwritten).
+
+```{python}
+import shutil, glob
+
+# ── Create folder structure ──────────────────────────────────────────────────
+for folder in [project_dir, gis_dir, org_shps, sm_shps, table_dir,
+               exe_dir, run_dir,
+               os.path.join(run_dir, "GIS", "org_shps"),
+               os.path.join(run_dir, "GIS", "SMshps"),
+               os.path.join(run_dir, "GIS", "Table"),
+               os.path.join(project_dir, "Scenarios"),
+               os.path.join(project_dir, "DB"),
+               os.path.join(project_dir, "exported_files")]:
+    os.makedirs(folder, exist_ok=True)
+
+print("Folder structure created.")
+```
+
+```{python}
+# ── Copy SWAT TxtInOut files to the project root ────────────────────────────
+# The QGIS plugin places all SWAT files at the project root level.
+swat_files = glob.glob(os.path.join(swat_txtinout, "*"))
+n_copied = 0
+for src in swat_files:
+    dst = os.path.join(project_dir, os.path.basename(src))
+    _ = shutil.copy2(src, dst)
+    n_copied += 1
+
+print(f"Copied {n_copied} SWAT TxtInOut files → {project_dir}")
+```
+
+```{python}
+# ── Copy SWAT TxtInOut files to the coupled run folder too ──────────────────
+# run_dir needs an identical copy — it is the folder the executable runs from.
+n_run = 0
+for src in swat_files:
+    dst = os.path.join(run_dir, os.path.basename(src))
+    _ = shutil.copy2(src, dst)
+    n_run += 1
+
+print(f"Copied {n_run} SWAT TxtInOut files → {run_dir}")
+```
+
+```{python}
+# ── Copy SWAT shapefiles to org_shps (rename to plugin naming convention) ───
+shp_map = {
+    "hru1": "hru_org",    # HRU polygons   → hru_org.shp
+    "subs1": "sub_org",   # Subbasin polys → sub_org.shp
+    "riv1": "riv_org",    # River lines    → riv_org.shp
+}
+extensions = [".shp", ".dbf", ".shx", ".prj", ".cpg"]
+
+for src_stem, dst_stem in shp_map.items():
+    for ext in extensions:
+        src = os.path.join(swat_shapes, src_stem + ext)
+        dst = os.path.join(org_shps,   dst_stem + ext)
+        if os.path.isfile(src):
+            _ = shutil.copy2(src, dst)
+
+print("Shapefiles copied to org_shps:")
+for src_stem, dst_stem in shp_map.items():
+    print(f"  {src_stem}.shp  →  {dst_stem}.shp")
+```
+
+```{python}
+# ── Copy executables from the reference project ──────────────────────────────
+# Source: data/SWAT-MODFLOW/SM_exes/ (ships with the repository)
+ref_exe_dir = os.path.join(REPO_DIR, "data", "SWAT-MODFLOW", "SM_exes")
+
+exe_files = glob.glob(os.path.join(ref_exe_dir, "*.exe"))
+for exe in exe_files:
+    _ = shutil.copy2(exe, os.path.join(exe_dir, os.path.basename(exe)))
+    print(f"  {os.path.basename(exe)}")
+
+print("Executables copied to SM_exes/")
+```
+
+### 1.3  Simulation period
+
+The simulation dates are read from `file.cio`.
+
+The example model runs **9 years (1980 – 1988)** with a 1-year warm-up, so
+output starts from 1981.  SWAT is configured for **daily** output
+(`IPRINT = 1`).
+
+```{python}
+from swatmf import parse_file_cio
+
+sp = parse_file_cio(wd)
+
+print(f"Simulation start  : {sp.start_date.date()}")
+print(f"Simulation end    : {sp.end_date.date()}")
+print(f"Warm-up start     : {sp.start_date_warmup.date()}")
+print(f"Warm-up end       : {sp.end_date_warmup.date()}")
+print(f"Warm-up years     : {sp.skipyear}")
+print(f"SWAT iprint code  : {sp.iprint}  "
+      f"({'daily' if sp.iprint==1 else 'monthly' if sp.iprint==0 else 'annual'})")
+```
+
+```{python}
+# Convenience date strings used throughout
+start_str  = sp.start_date_warmup.strftime("%m/%d/%Y")    # for pandas date_range
+start_mdy  = sp.start_date.strftime("%m-%d-%Y")           # for Julian-day conversion
+end_year   = sp.end_date.year
+iprint     = sp.iprint
+sim_period = (sp.end_date - sp.start_date).days
+
+print(f"Output start date : {start_str}")
+print(f"Simulation length : {sim_period} days")
+```
+
+
+---
+
+## 2  Pre-Processing Tab
+
+The pre-processing steps configure the spatial linkage between SWAT and
+MODFLOW.  The `swatmf` package handles all file-based I/O and spatial
+operations (intersections, area calculations, link table generation) without
+requiring QGIS.
+
+- **Scenario C** (build from scratch) generates `mf_grid.gpkg` entirely in
+  Python via `create_mf_grid`.
+- **Scenarios A and B** (existing model) may still require QGIS to create the
+  initial `mf_grid` shapefile if one does not already exist.
+
+### 2.1  SWAT Inputs
+
+Verify that the required SWAT output files are present in the working
+directory before proceeding.
+
+```{python}
+required_swat = ["file.cio", "output.rch", "output.std"]
+missing = [f for f in required_swat if not os.path.isfile(os.path.join(wd, f))]
+
+if missing:
+    print("⚠ Missing SWAT files:", missing)
+else:
+    print("✔ All required SWAT files found.")
+```
+
+### 2.2  MODFLOW Options
+
+Choose one of the three scenarios that matches your project:
+
+| Scenario | Description |
+|----------|-------------|
+| **A** | MODFLOW model files **and** grid shapefile are already available |
+| **B** | MODFLOW model files are available but the grid shapefile is missing |
+| **C** | No MODFLOW model yet — **build from scratch** (used in this example) |
+
+**This workflow uses Scenario C** — the MODFLOW model is built from scratch
+using `build_mf_model_from_dem` with the DEM from `data/swat/Source/dem.tif`.
+Scenarios A and B are shown below as reference (not executed).
+
+---
+
+#### Scenario A — Existing QGIS plugin project *(reference — not executed)*
+
+When the project folder was created by the QGIS plugin, `mf_grid.gpkg` and
+all MODFLOW rasters are already in `GIS/org_shps/`.
+
+```{python}
+#| eval: false
+import geopandas as gpd
+from swatmf.preprocessing.modflow import parse_dis_file, grid_row_col
+
+# Read MODFLOW grid dimensions from the .dis file.
+dis = parse_dis_file(mf_wd)
+
+print(f"Grid        : {dis.nrow} rows × {dis.ncol} cols  ({dis.n_cells:,} cells)")
+print(f"Cell size   : delr={dis.delr} m  delc={dis.delc} m")
+print(f"Transient   : {dis.transient}")
+print(f"Top elevs   : min={min(dis.top_elevs):.2f}  max={max(dis.top_elevs):.2f} m")
+
+# Build 1-based row/col index lists.
+rows_all, cols_all = grid_row_col(dis)
+print(f"First cell: row={rows_all[0]}, col={cols_all[0]}")
+
+# mf_grid.gpkg is already in org_shps — just load it.
+mfgrid_path = os.path.join(org_shps, "mf_grid.gpkg")
+grid_gdf = gpd.read_file(mfgrid_path)
+print(f"Grid cells loaded: {len(grid_gdf)}  "
+      f"(rows={grid_gdf['row'].max()}, cols={grid_gdf['col'].max()})")
+```
+
+---
+
+#### Scenario B — MODFLOW files present, grid shapefile missing *(reference — not executed)*
+
+Parse the existing `.dis` file and create `mf_grid.gpkg` using the NW corner
+of the model domain (from QGIS layer properties or the boundary shapefile):
+
+```{python}
+#| eval: false
+from swatmf.preprocessing.modflow import parse_dis_file, create_mf_grid
+import geopandas as gpd, glob
+
+dis = parse_dis_file(mf_wd)
+
+# Derive the NW corner from the model boundary shapefile.
+bnd_gdf = gpd.read_file(os.path.join(org_shps, "mf_boundary.shp"))
+b    = bnd_gdf.total_bounds
+X_NW = b[0]   # left  (easting)
+Y_NW = b[3]   # top   (northing)
+print(f"NW corner: ({X_NW:.1f}, {Y_NW:.1f})")
+
+# Create mf_grid.gpkg and save it to org_shps.
+mfgrid_path = create_mf_grid(
+    swatmf_folder = mf_wd,
+    x_origin      = X_NW,
+    y_origin      = Y_NW,
+    crs           = 2193,          # EPSG code of your model CRS
+    output_dir    = org_shps,
+)
+print(f"mf_grid.gpkg written to: {mfgrid_path}")
+```
+
+---
+
+#### Scenario C — Build a new MODFLOW model from scratch *(active for this example)*
+
+`build_mf_model_from_dem` generates all required MODFLOW input files **and**
+`mf_grid.gpkg` in a single call.  The function:
+
+* Dissolves the subbasin boundary and clips the DEM to it.
+* Resamples the DEM to *cell_size* and derives the MODFLOW `ibound` mask.
+* Builds the BAS, DIS, UPW, OC, NWT, and RCH packages using flopy.
+* Writes `mf_grid.gpkg` with `grid_id`, `row`, `col`, `top_elev` columns.
+* Saves MODFLOW parameter rasters (`top_elev.tif`, `bot_elev.tif`, `hk.tif`,
+  `sy.tif`, `ss.tif`, `ih.tif`) to `org_shps` for visualisation in QGIS.
+
+The MODFLOW files are written directly to `run_dir` so that SWAT and MODFLOW
+files share one folder for the coupled simulation.
+
+```{python}
+import geopandas as gpd
+from swatmf.preprocessing.modflow import build_mf_model_from_dem
+
+# ── Dissolve subbasin polygons to get the watershed boundary ─────────────────
+sub_gdf  = gpd.read_file(os.path.join(org_shps, "sub_org.shp"))
+bnd_path = os.path.join(org_shps, "mf_boundary.shp")
+sub_gdf.dissolve().to_file(bnd_path)
+print(f"Watershed boundary written: {bnd_path}")
+
+# ── MODFLOW model parameters ─────────────────────────────────────────────────
+MF_NAME    = "qswatmod"   # base name for all MODFLOW files
+
+# Cell size — 100 m gives a manageable grid for the example watershed
+# (~16 km × 13 km → roughly 160 rows × 130 cols = ~20 000 cells).
+CELL_SIZE  = 100.0        # [m]
+
+# Aquifer parameters — adjust to match your site.
+THICKNESS  = 50.0         # uniform aquifer thickness [m]
+SY         = 0.2          # specific yield [-]
+HK         = 5.0          # horizontal hydraulic conductivity [m/day]
+SS         = 1e-4         # specific storage [1/m]
+HEAD_DEPTH = 2.0          # initial head = DEM elevation − HEAD_DEPTH [m]
+
+# CRS: None → inherit from the DEM (EPSG:2193 for this dataset).
+CRS = None
+
+# Simulation duration: SWAT run length + buffer.
+duration = sim_period + 100
+# ─────────────────────────────────────────────────────────────────────────────
+
+result_c = build_mf_model_from_dem(
+    dem_path          = dem_path,       # data/swat/Source/dem.tif  (4 m, EPSG:2193)
+    mf_folder         = run_dir,        # MODFLOW files written to the run folder
+    mf_name           = MF_NAME,
+    boundary_path     = bnd_path,       # dissolved watershed boundary
+    cell_size         = CELL_SIZE,
+    aquifer_thickness = THICKNESS,
+    sy                = SY,
+    head_depth        = HEAD_DEPTH,
+    hk                = HK,
+    ss                = SS,
+    crs               = CRS,
+    output_dir        = org_shps,       # mf_grid.gpkg + rasters → GIS/org_shps/
+    sim_duration      = duration,
+)
+
+print(f"MODFLOW model '{MF_NAME}' written to : {run_dir}")
+print(f"Grid dimensions : {result_c.nrow} rows × {result_c.ncol} cols "
+      f"({result_c.nrow * result_c.ncol:,} cells)")
+print(f"NW origin       : ({result_c.x_origin:.1f}, {result_c.y_origin:.1f})  [EPSG:2193 m]")
+print(f"mf_grid.gpkg    : {result_c.grid_path}")
+
+# Set mf_wd and mfgrid_path for the remainder of the workflow.
+mf_wd       = run_dir
+mfgrid_path = result_c.grid_path
+```
+
+```{python}
+# Also copy mf_grid.gpkg into the nested GIS/org_shps under run_dir so the
+# run folder mirrors the full QGIS plugin layout.
+import shutil
+_ = shutil.copy2(
+    mfgrid_path,
+    os.path.join(run_dir, "GIS", "org_shps", "mf_grid.gpkg")
+)
+print("mf_grid.gpkg mirrored into run_dir/GIS/org_shps/")
+```
+
+```{python}
+# Inspect the resulting grid object.
+import geopandas as gpd
+
+grid_gdf = gpd.read_file(mfgrid_path)
+print(f"Grid cells loaded : {len(grid_gdf)}")
+print(f"  rows={grid_gdf['row'].max()}  cols={grid_gdf['col'].max()}")
+print(f"  CRS: {grid_gdf.crs}")
+print(f"  top_elev range: {grid_gdf['top_elev'].min():.1f} – "
+      f"{grid_gdf['top_elev'].max():.1f} m")
+```
+
+If you need to add river cells after the initial build, derive them with
+`compute_riv_params` / `write_riv_file` (see Section 2.4) and pass the
+resulting DataFrame as the `riv_df` argument.
+
+> **Manual alternative** — if you already have numpy elevation arrays (e.g.
+> loaded from your own raster pipeline), you can call `create_mf_model` and
+> `create_mf_grid` individually as shown in the collapsible block below.
+
+<details>
+<summary>Manual array approach (click to expand)</summary>
+
+```{python}
+#| eval: false
+import numpy as np
+from swatmf.preprocessing.modflow import create_mf_model, create_mf_grid
+
+# Adjust NROW/NCOL/DELR/DELC to match your domain.
+# For the qswatmod-test watershed (EPSG:2193, ~16 km × 13 km) at 100 m:
+NROW, NCOL = 127, 156      # approximate — computed from DEM extents ÷ cell size
+DELR = DELC = 100.0        # [m]
+
+# NW corner of the grid in EPSG:2193 metres (from sub_org.shp total_bounds).
+# X_NW = left extent; Y_NW = top extent.
+X_ORIGIN = 1876887.0
+Y_ORIGIN = 5773616.0
+
+# Placeholder elevation arrays — replace with DEM-derived values in practice.
+top_elev = np.full((NROW, NCOL), 300.0)
+bot_elev = top_elev - 50.0   # 50 m thick aquifer
+
+MF_MANUAL_FOLDER = os.path.join(out, "mf_manual")
+os.makedirs(MF_MANUAL_FOLDER, exist_ok=True)
+
+mf_manual = create_mf_model(
+    mf_folder    = MF_MANUAL_FOLDER,
+    mf_name      = "qswatmod_manual",
+    top_elev     = top_elev,
+    bot_elev     = bot_elev,
+    delr         = DELR,
+    delc         = DELC,
+    hk           = 5.0,
+    ss           = 1e-4,
+    sy           = 0.2,
+    initial_head = top_elev - 2.0,
+    riv_df       = None,
+    sim_duration = duration,
+)
+
+mfgrid_path_manual = create_mf_grid(
+    swatmf_folder = MF_MANUAL_FOLDER,
+    x_origin      = X_ORIGIN,
+    y_origin      = Y_ORIGIN,
+    crs           = 2193,           # EPSG:2193 — NZGD2000 / NZ Transverse Mercator
+    output_dir    = org_shps,
+)
+print("mf_grid.gpkg written to:", mfgrid_path_manual)
+```
+
+</details>
+
+After either build route, validate the MODFLOW inputs and generate the
+required `modflow.mfn` helper file:
+
+```{python}
+from swatmf.preprocessing.modflow import check_modflow_files
+
+# Validate the MODFLOW model folder (run_dir for this Scenario C example,
+# or wherever mf_wd was set for Scenarios A/B).
+check_result = check_modflow_files(mf_wd)
+for msg in check_result["messages"]:
+    print(msg)
+print("Status:", check_result["status"])
+```
+
+`check_modflow_files` replicates the **Check MODFLOW file** button in the
+QSWATMOD2 plugin.  It validates that the required `.dis`, `.nam`, and `.oc`
+files exist, generates `modflow.mfn` (adjusting unit numbers so they do not
+conflict with SWAT-MODFLOW), and updates the `HEAD SAVE UNIT` value in the
+`.oc` file.
+
+You can also run the two sub-steps individually:
+
+```{python}
+from swatmf.preprocessing.modflow import create_modflow_mfn, modify_modflow_oc
+
+mfn_path = create_modflow_mfn(mf_wd)
+print("modflow.mfn written to:", mfn_path)
+
+oc_path = modify_modflow_oc(mf_wd)
+print("OC file updated       :", oc_path)
+```
+
+> **This example (Scenario C)** — `mf_wd` is `run_dir`; the MODFLOW files
+> were written there by `build_mf_model_from_dem` above.  For Scenarios A / B,
+> ensure your pre-built MODFLOW files are present in `mf_wd` before this step.
+
+### 2.3  Create the `modflow.obs` file
+
+The `modflow.obs` file lists the MODFLOW grid cells that correspond to
+groundwater-level observation wells.  Each row requires a `grid_id` (1-based
+cell index = `(row - 1) × ncol + col`), `layer`, and `top_elev`.
+
+> **Grid IDs vs well identifiers** — The correct grid IDs must be found by
+> spatially joining the observation well point shapefile with `mf_grid.gpkg`.
+> Well name columns in observed CSV files are identifiers, not MODFLOW cell IDs.
+> The example below shows the workflow; substitute your own well point shapefile.
+
+```{python}
+# Read the MODFLOW grid dimensions — needed for post-processing and RT3D.
+from swatmf.preprocessing.modflow import parse_dis_file
+dis = parse_dis_file(mf_wd)
+print(f"Grid: {dis.nrow} rows × {dis.ncol} cols  ({dis.n_cells:,} active cells)")
+```
+
+```{python}
+import geopandas as gpd
+import pandas as pd
+from swatmf.preprocessing.modflow import create_modflow_obs, read_modflow_obs
+
+# Spatial join: find which mf_grid cell each observation well falls in.
+# Replace the path below with your own well point shapefile.
+well_shp = os.path.join(org_shps, "obs_wells.shp")   # ← update filename
+
+if os.path.isfile(well_shp):
+    obs_pts  = gpd.read_file(well_shp)
+    grid_gdf = gpd.read_file(mfgrid_path)
+
+    if obs_pts.crs != grid_gdf.crs:
+        obs_pts = obs_pts.to_crs(grid_gdf.crs)
+
+    obs_joined = gpd.sjoin(
+        obs_pts,
+        grid_gdf[["grid_id", "top_elev", "geometry"]],
+        how="left",
+        predicate="within",
+    )
+
+    obs_valid = obs_joined.dropna(subset=["grid_id"]).copy()
+    obs_valid["grid_id"] = obs_valid["grid_id"].astype(int)
+
+    obs_wells = pd.DataFrame({
+        "grid_id":  obs_valid["grid_id"].values,
+        "layer":    1,
+        "top_elev": obs_valid["top_elev"].values,
+    })
+    print("Observation wells assigned to grid cells:")
+    print(obs_wells)
+
+    # Write modflow.obs — mf_wd for the .dis lookup, table_dir for the output.
+    obs_path = create_modflow_obs(mf_wd, obs_wells, output_dir=table_dir)
+    print("modflow.obs written to:", obs_path)
+else:
+    # No well shapefile available — write a zero-record file.
+    # Groundwater-level output will not be produced when modflow.obs is empty.
+    obs_wells = pd.DataFrame(columns=["grid_id", "layer", "top_elev"])
+    obs_path  = create_modflow_obs(mf_wd, obs_wells, output_dir=table_dir)
+    print(f"⚠ No observation well shapefile found at:\n  {well_shp}")
+    print(f"  Empty modflow.obs written to {obs_path}")
+    print("  Update 'well_shp' above to enable groundwater-level output.")
+```
+
+### 2.4  River Connections
+
+The river connection option determines which MODFLOW grid cells represent
+river boundaries.  Choose one of the three options:
+
+| Option | Description | MODFLOW layer name |
+|--------|-------------|--------------------|
+| **Option 1 — MODFLOW river only** | River cells taken directly from the `.riv` package | `mf_riv1` |
+| **Option 2 — SWAT river only** | MODFLOW cells that spatially intersect the SWAT river network | `mf_riv2` |
+| **Option 3 — Both networks** | Combination: Option 2 cells plus any Option 1 cells not already included | `mf_riv3` |
+
+The cell selection and shapefile creation steps require QGIS.  Once the
+river shapefile is ready, parse the hydraulic parameters and (if needed)
+update the `.riv` package file:
+
+```{python}
+from swatmf.preprocessing.modflow import parse_riv_file, compute_riv_params, write_riv_file
+import glob as _glob
+
+# --- Option 1: read river cells directly from the existing .riv package ----
+# Only applicable when a .riv file already exists in mf_wd.
+riv_files = _glob.glob(os.path.join(mf_wd, "*.riv"))
+if riv_files:
+    riv_df = parse_riv_file(mf_wd)
+    print(f"River cells found in .riv package: {len(riv_df)}")
+    print(riv_df.head())
+else:
+    riv_df = None
+    print("No .riv package found — use Option 2 or 3 to derive river cells "
+          "from the SWAT river network (see below).")
+```
+
+```{python}
+# --- Option 2 (active for Scenario C): intersect SWAT river network with grid
+# The SWAT river shapefile (riv_org.shp) has Wid2 and Dep2 attributes.
+# We spatially intersect it with the MODFLOW grid to get river_grid, then
+# compute conductance and write the .riv file.
+
+import geopandas as gpd
+import pandas as pd
+from swatmf.preprocessing.modflow import compute_riv_params, write_riv_file
+from swatmf.preprocessing.linking import generate_river_grid
+from swatmf.simulation import write_swatmf_river2grid
+
+riv_org_path = os.path.join(org_shps, "riv_org.shp")
+sub_org_path = os.path.join(org_shps, "sub_org.shp")
+
+if os.path.isfile(riv_org_path) and os.path.isfile(mfgrid_path):
+    # Step 1: intersect SWAT river lines with the MODFLOW grid and subbasins.
+    # Returns: grid_id, subbasin, rgrid_len.
+    # Also writes the river_grid link table to table_dir.
+    river_grid_df = generate_river_grid(
+        riv_path    = riv_org_path,
+        mfgrid_path = mfgrid_path,
+        sub_path    = sub_org_path,
+        table_dir   = table_dir,    # writes river_grid to GIS/Table/
+    )
+    print(f"River–grid intersection: {len(river_grid_df)} cell-reach segments")
+
+    # Step 2: join row, col, top_elev from mf_grid (needed by compute_riv_params).
+    grid_gdf = gpd.read_file(mfgrid_path)[["grid_id", "row", "col", "top_elev"]]
+    river_grid_df = river_grid_df.merge(grid_gdf, on="grid_id", how="left")
+
+    # Step 3: join Wid2 and Dep2 from the SWAT river shapefile (per subbasin).
+    riv_gdf = gpd.read_file(riv_org_path)[["Subbasin", "Wid2", "Dep2"]]
+    riv_gdf = riv_gdf.rename(columns={"Subbasin": "subbasin"})
+    # Aggregate to one row per subbasin (length-weighted mean would be ideal;
+    # simple mean is used here as a reasonable approximation).
+    riv_attrs = riv_gdf.groupby("subbasin")[["Wid2", "Dep2"]].mean().reset_index()
+    river_grid_df = river_grid_df.merge(riv_attrs, on="subbasin", how="left")
+
+    print(f"river_grid columns: {list(river_grid_df.columns)}")
+    print(river_grid_df.head())
+
+    # Step 4a: write swatmf_river2grid.txt — the file the Fortran executable reads
+    # at runtime to map MODFLOW river cells back to SWAT subbasins.
+    r2g_path = write_swatmf_river2grid(river_grid_df, run_dir)
+    print(f"swatmf_river2grid.txt written: {r2g_path}  ({len(river_grid_df.groupby('grid_id'))} river cells)")
+
+    # Step 4c: compute MODFLOW RIV package parameters and write the .riv file.
+    riv_params = compute_riv_params(
+        river_grid_df,
+        riverbed_k     = 0.1,    # riverbed hydraulic conductivity [m/day]
+        riverbed_thick = 0.5,    # riverbed thickness [m]
+    )
+    riv_path = write_riv_file(mf_wd, riv_params)
+    print(f"RIV package written: {riv_path}  ({len(riv_params)} river cells)")
+    riv_df = riv_params          # used in Section 7 (GW-SW exchange)
+else:
+    riv_df = None
+    print("⚠ riv_org.shp or mf_grid.gpkg not found — skipping river connection.")
+```
+
+### 2.5  Linking Process
+
+The linking process creates three tab-delimited ASCII tables read by the
+SWAT-MODFLOW executable at runtime:
+
+| File | Description |
+|------|-------------|
+| `hru_dhru` | Maps each disaggregated HRU (dHRU) to its parent HRU and subbasin |
+| `dhru_grid` | Maps each dHRU fragment to the MODFLOW grid cells it overlaps (sorted by grid × dHRU) |
+| `grid_dhru` | Inverse mapping: sorted by dHRU × grid; header contains `nrow` and `ncol` |
+
+All three files are generated using :mod:`swatmf.preprocessing.linking`, which
+replicates the QGIS **Linking Process** panel using GeoPandas.
+
+**Required input shapefiles** (created by the QGIS plugin):
+
+| File | Contents | Location |
+|------|----------|----------|
+| `hru_org.shp` | Original SWAT HRU polygons | `GIS/org_shps/` |
+| `sub_org.shp` | Original SWAT subbasin polygons | `GIS/org_shps/` |
+| `mf_grid.gpkg` | MODFLOW grid polygons with `grid_id` | `GIS/org_shps/` |
+
+The link tables (`hru_dhru`, `dhru_grid`, `river_grid`) are written to
+`GIS/Table/`.  For this Scenario C example they are generated here; for a
+project set up with the QGIS plugin they are already present.
+
+```{python}
+import geopandas as gpd
+from swatmf.preprocessing.linking import generate_link_tables
+
+# ── Input file paths (QGIS plugin layout) ───────────────────────────────────
+hru_path    = os.path.join(org_shps, "hru_org.shp")
+sub_path    = os.path.join(org_shps, "sub_org.shp")
+# mfgrid_path was set in Section 2.2; default is org_shps/mf_grid.gpkg.
+# ────────────────────────────────────────────────────────────────────────────
+
+result = generate_link_tables(
+    hru_path          = hru_path,
+    sub_path          = sub_path,
+    mfgrid_path       = mfgrid_path,
+    table_dir         = table_dir,    # GIS/Table/ — same folder the plugin uses
+    swatmf_folder     = mf_wd,        # reads .dis to embed nrow/ncol in grid_dhru
+    # Optional: save intermediate GeoPackages for QA/QC in QGIS
+    save_intermediate = True,
+    intermediate_dir  = sm_shps,      # GIS/SMshps/
+)
+
+for name, fpath in result.items():
+    status = "✔ found" if os.path.isfile(fpath) else "⚠ MISSING"
+    print(f"  {name:<15} {status}  →  {fpath}")
+```
+
+Inspect the first few lines of each file:
+
+```{python}
+for name, fpath in result.items():
+    print(f"\n--- {name} ---")
+    with open(fpath) as fh:
+        for i, line in enumerate(fh):
+            if i >= 6:
+                break
+            print(line, end="")
+```
+
+If you need to run only one part of the pipeline (e.g. to inspect intermediate
+results), the individual functions are also available:
+
+```{python}
+from swatmf.preprocessing.linking import (
+    create_dhru,       # HRU multipart → singlepart dHRUs
+    build_hru_dhru,    # dHRU × subbasin intersection
+    export_hru_dhru,   # write hru_dhru file
+    build_dhru_grid,   # dHRU × MODFLOW grid intersection
+    export_dhru_grid,  # write dhru_grid file
+    export_grid_dhru,  # write grid_dhru file (inverse sort, nrow/ncol header)
+)
+
+hru_gdf    = gpd.read_file(hru_path)       # SWAT HRU polygons (org_shps/hru_org.shp)
+sub_gdf    = gpd.read_file(sub_path)       # SWAT subbasin polygons (org_shps/sub_org.shp)
+mfgrid_gdf = gpd.read_file(mfgrid_path)   # MODFLOW grid polygons (org_shps/mf_grid.gpkg)
+
+# Step-by-step pipeline
+dhru          = create_dhru(hru_gdf)
+hru_dhru_gdf  = build_hru_dhru(dhru, sub_gdf)
+dhru_grid_gdf = build_dhru_grid(dhru, mfgrid_gdf)
+
+print(f"dHRUs             : {len(dhru)}")
+print(f"hru_dhru records  : {len(hru_dhru_gdf)}")
+print(f"dhru_grid records : {len(dhru_grid_gdf)}")
+```
+
+### 2.6  Create Linkage Files
+
+The SWAT-MODFLOW executable expects **all** inputs — SWAT files, MODFLOW
+packages, link tables, and `modflow.mfn` — assembled in a single run
+directory (`run_dir`).  Two copy steps bring everything together:
+
+#### 2.6a  Copy link tables (HRU–MODFLOW mapping)
+
+The link tables in `GIS/Table/` (created by the QGIS plugin or by
+`generate_link_tables` in Section 2.5) are copied into `run_dir`:
+
+```{python}
+from swatmf.simulation import copy_link_files
+
+link_copied = copy_link_files(
+    table_dir     = table_dir,    # source: GIS/Table/
+    swatmf_folder = run_dir,      # destination: SWAT-MODFLOW/ (run folder)
+)
+
+print(f"Link tables copied ({len(link_copied)} files):")
+for f in link_copied:
+    print(f"  {os.path.basename(f)}")
+```
+
+| File | Role |
+|------|------|
+| `hru_dhru` | dHRU → HRU / subbasin mapping |
+| `dhru_grid` | dHRU → MODFLOW grid mapping (sorted by grid × dHRU) |
+| `grid_dhru` | dHRU → MODFLOW grid mapping (sorted by dHRU × grid) |
+| `river_grid` | MODFLOW river-cell routing table |
+
+#### 2.6b  Copy MODFLOW model files
+
+The MODFLOW input packages (`.dis`, `.bas`, `.nam`, `.nwt`, `.upw`, `.riv`,
+`.oc` …) and `modflow.obs` must be present in `run_dir` alongside the SWAT
+files.  `copy_modflow_files` copies them from `mf_wd` and regenerates
+`modflow.mfn` with correct bare-filename references.
+
+For **Scenario C** the MODFLOW files were written directly into `run_dir` by
+`build_mf_model_from_dem`, so `mf_wd == run_dir` and no copy is needed.
+For **Scenarios A / B** `mf_wd` is a separate folder and the copy is required.
+
+```{python}
+from swatmf.simulation import copy_modflow_files
+from swatmf.preprocessing.modflow import create_modflow_mfn
+import os
+
+if os.path.realpath(mf_wd) == os.path.realpath(run_dir):
+    # Scenario C: MODFLOW files already in run_dir — nothing to copy.
+    # Regenerate modflow.mfn here so any .riv written in Section 2.4 is
+    # included (check_modflow_files in Section 2.3 ran before the .riv existed).
+    print("MODFLOW files are already in run_dir — skipping copy.")
+    create_modflow_mfn(run_dir)
+    print("modflow.mfn regenerated (RIV injection applied if .riv present).")
+else:
+    # Scenarios A / B: copy from the separate MODFLOW model folder.
+    # copy_modflow_files calls create_modflow_mfn internally.
+    mf_copied = copy_modflow_files(
+        mf_folder     = mf_wd,
+        swatmf_folder = run_dir,
+    )
+    print(f"MODFLOW files copied ({len(mf_copied)} files):")
+    for f in mf_copied:
+        print(f"  {os.path.basename(f)}")
+```
+
+#### 2.6c  Copy the executable
+
+The SWAT-MODFLOW executable from `SM_exes/` must also be present in `run_dir`:
+
+```{python}
+import shutil, glob
+
+exe_files = glob.glob(os.path.join(exe_dir, "swatmf_rel*.exe")) + \
+            glob.glob(os.path.join(exe_dir, "SWAT-MODFLOW*.exe"))
+
+for exe in exe_files:
+    dest = os.path.join(run_dir, os.path.basename(exe))
+    _ = shutil.copy2(exe, dest)
+    print(f"Copied: {os.path.basename(exe)}")
+```
+
+Verify that everything the executable needs is now in place:
+
+### 2.7  RT3D — Reactive Transport Pre-Processing (optional)
+
+If you plan to simulate nitrogen and phosphorus transport in the groundwater
+system, create the RT3D input files here.  RT3D requires the MODFLOW model to
+be already set up (grid dimensions are read from the `.dis` file).
+
+The `swatmf.preprocessing.rt3d` module writes all six RT3D package files plus
+the master `rt3d_filenames` list:
+
+| File | Purpose |
+|------|---------|
+| `.btn` | Basic Transport — species, porosity, ICBUND, initial concentrations, output times |
+| `.dsp` | Dispersion — longitudinal dispersivity and transverse/vertical ratios |
+| `.rct` | Reaction — denitrification kinetics (IREACT=10), sorption, bulk density |
+| `.gcg` | Implicit GCG solver settings |
+| `.adv` | Advection method selection |
+| `.ssm` | Source/Sink Mixing (minimal — concentrations are passed at runtime via SMRT) |
+| `rt3d_filenames` | Maps package codes to file paths for the executable |
+
+```{python}
+from swatmf.preprocessing.rt3d import RT3DConfig, write_rt3d_model
+from swatmf.preprocessing.modflow import parse_dis_file
+
+# ── Read grid dimensions from the existing MODFLOW .dis file ────────────────
+import glob as _glob
+
+dis_files = _glob.glob(os.path.join(mf_wd, "*.dis"))
+if dis_files:
+    dis_info = parse_dis_file(mf_wd)
+    NROW = dis_info.nrow
+    NCOL = dis_info.ncol
+    print(f"Grid: {NROW} rows × {NCOL} cols (from {os.path.basename(dis_files[0])})")
+else:
+    # Fallback: use dimensions from the parsed dis object (Section 2.2).
+    NROW = dis.nrow
+    NCOL = dis.ncol
+    print(f"Grid: {NROW} rows × {NCOL} cols (from Section 2.2 dis object)")
+```
+
+```{python}
+# ── Configure RT3D parameters ───────────────────────────────────────────────
+rt3d_cfg = RT3DConfig(
+    model_name   = "rt3d_model",
+    nrow         = NROW,
+    ncol         = NCOL,
+    nlay         = 1,
+
+    # Transport properties
+    porosity     = 0.30,       # scalar: applied to all active cells
+
+    # Initial concentrations [mg/L]
+    initial_conc_no3 = 0.5,    # uniform background NO₃
+    initial_conc_p   = 0.01,   # uniform background P
+
+    # Dispersion
+    longitudinal_dispersivity = 10.0,   # [m]
+    ratio_h_to_l              = 0.1,
+    ratio_v_to_l              = 0.01,
+    effective_molecular_diffusion = 0.0,
+
+    # Reaction
+    bulk_density       = 1.50,   # [g/cm³]
+    sorption_no3       = 0.0,    # no sorption for NO₃
+    sorption_p         = 0.0,    # no sorption for P
+    k_denitrification  = 0.01,   # first-order rate [1/day]
+    k_half_saturation  = 10.0,   # Monod half-saturation [mg/L]
+
+    # Observation cells (optional) — use same cells as MODFLOW obs
+    # obs_cells = pd.read_csv(os.path.join(wd, "modflow.obs"), ...)
+)
+
+# ── Write output times (e.g. daily for 1 year) ─────────────────────────────
+# Adjust to match your simulation length
+output_times = list(range(1, 366))
+```
+
+```{python}
+# ── Write all RT3D files to the run directory ───────────────────────────────
+rt3d_files = write_rt3d_model(run_dir, rt3d_cfg, output_times=output_times)
+
+print("RT3D files written:")
+for pkg, path in rt3d_files.items():
+    print(f"  {pkg:<12} → {os.path.basename(path)}")
+```
+
+::: {.callout-note}
+Remember to enable RT3D in the simulation flags (Section 3.1):
+```python
+cfg.rt3d_active = True
+```
+Without this flag, the SWAT-MODFLOW executable will ignore the RT3D input
+files even if they exist.
+:::
+
+---
+
+## 3  Simulation Tab
+
+The simulation tab writes `swatmf_link.txt`, which controls all SWAT-MODFLOW
+run-time options.
+
+### 3.1  Configure the simulation flags
+
+```{python}
+from swatmf.simulation import SwatmfLinkConfig, write_swatmf_link, summarise_link_config
+
+# Start from defaults (matches the template file shipped with QSWATMOD2)
+cfg = SwatmfLinkConfig.defaults()
+
+# ── Edit these flags to match your scenario ─────────────────────────────────
+
+# Pumping Rate Dictated by MODFLOW
+# Enable if MODFLOW pumping wells supply irrigation water to SWAT HRUs.
+cfg.pumping_mf = False          # True → MODFLOW Pumping → SWAT Irrigation
+
+# Pumping Rate Dictated by SWAT
+# Enable if SWAT auto-irrigation triggers groundwater extraction in MODFLOW.
+cfg.pumping_swat = False        # True → SWAT Auto-Irrigation → MODFLOW Pumping
+
+# MODFLOW DRAIN Cells to SWAT Subbasin Channels
+# Enable if MODFLOW DRAIN-cell fluxes should be routed to SWAT channels.
+cfg.drain_cells = False         # True → MODFLOW DRN → SWAT subbasin channels
+
+# Read observation cells from modflow.obs
+# Automatically disabled when no observation wells were defined (avoids Fortran EOF crash)
+cfg.read_mf_obs = len(obs_wells) > 0   # True → enables groundwater-level output
+
+# Optional output flags
+cfg.output_swat_dp       = True
+cfg.output_mf_recharge   = True
+cfg.output_channel_depth = True
+cfg.output_river_stage   = True
+cfg.output_gwsw_grid     = True
+cfg.output_gwsw_sub      = True
+cfg.output_print_avg     = True
+
+# RT3D reactive transport (nitrogen & phosphorus in groundwater)
+# Enable only if RT3D input files were created in Section 2.7
+cfg.rt3d_active = False         # True → activate RT3D N/P transport
+
+# Output frequency: write results every N days (1 = every day)
+cfg.output_step = 1
+
+# ────────────────────────────────────────────────────────────────────────────
+print(summarise_link_config(cfg))
+```
+
+### 3.2  Groundwater Delay
+
+Groundwater delay (`GW_DELAY`) controls how many days deep percolation from
+SWAT takes to reach the water table in MODFLOW.
+
+```{python}
+# ── Option A: single value applied to all HRUs ──────────────────────────────
+cfg.gw_delay_per_hru = False
+cfg.gw_delay         = 31.0    # [days]
+
+# ── Option B: one value per HRU (from the gw_delay QGIS layer) ─────────────
+# cfg.gw_delay_per_hru = True
+# cfg.gw_delay_values  = [10, 14, 31, 45, ...]  # one entry per HRU, sorted by HRU_ID
+```
+
+### 3.3  Write `swatmf_link.txt`
+
+```{python}
+link_path = write_swatmf_link(run_dir, cfg, sim_period=sim_period)
+print("swatmf_link.txt written to:", link_path)
+
+# Show the first 20 lines to confirm
+with open(link_path) as fh:
+    for i, line in enumerate(fh):
+        if i >= 20:
+            break
+        print(line, end="")
+```
+
+### 3.4  Read back and verify
+
+```{python}
+from swatmf.simulation import read_swatmf_link
+
+cfg_check = read_swatmf_link(run_dir)
+print(summarise_link_config(cfg_check))
+```
+
+### 3.5  Pre-flight Check
+
+Confirm that every file the executable needs is present in `run_dir` before
+launching.  Re-run any flagged steps if anything is missing or still sitting
+only in `GIS/Table/`.
+
+```{python}
+# Files the Fortran executable actually reads at runtime.
+# hru_dhru / dhru_grid / grid_dhru are human-readable QA tables — NOT read by
+# the exe — so they are excluded here.
+# modflow.obs is only read when cfg.read_mf_obs is True (observation wells).
+required_always = [
+    "swatmf_link.txt",       # coupling flags  (step 3.3)
+    "swatmf_grid2dhru.txt",  # grid→DHRU map   (step 2.5)
+    "swatmf_dhru2grid.txt",  # DHRU→grid map   (step 2.5)
+    "swatmf_dhru2hru.txt",   # DHRU→HRU map    (step 2.5)
+    "swatmf_river2grid.txt", # river→grid map  (step 2.4)
+    "modflow.mfn",           # MODFLOW name file (step 2.2)
+]
+
+all_ok = True
+for fname in required_always:
+    present = os.path.isfile(os.path.join(run_dir, fname))
+    status  = "✔ in run_dir" if present else "✘ MISSING"
+    if not present:
+        all_ok = False
+    print(f"  {fname:<30} {status}")
+
+# modflow.obs only required when observation wells are active
+if cfg.read_mf_obs:
+    present = os.path.isfile(os.path.join(run_dir, "modflow.obs"))
+    status  = "✔ in run_dir" if present else "✘ MISSING (copy from GIS/Table/)"
+    if not present:
+        all_ok = False
+    print(f"  {'modflow.obs':<30} {status}")
+else:
+    print(f"  {'modflow.obs':<30} — skipped (read_mf_obs = False)")
+
+# Spot-check that SWAT and MODFLOW input files are present
+n_hru = len([f for f in os.listdir(run_dir) if f.endswith(".hru")])
+n_dis = len([f for f in os.listdir(run_dir) if f.endswith(".dis")])
+print(f"\n  SWAT .hru files in run_dir : {n_hru}")
+print(f"  MODFLOW .dis files in run_dir: {n_dis}")
+if n_hru == 0 or n_dis == 0:
+    all_ok = False
+
+if all_ok:
+    print("\n✔ All required files are in run_dir — ready to simulate.")
+else:
+    print("\n⚠ Some files are missing.  Check the steps flagged above.")
+```
+
+### 3.6  Run Simulation
+
+
+Once `swatmf_link.txt`, link tables, SWAT files, MODFLOW files, and the
+executable are all in `run_dir`, launch the simulation.  The function
+searches `run_dir` for a recognised executable name and starts it with `cwd`
+set to `run_dir` so all relative file paths resolve correctly.
+
+`run_simulation_monitored` streams `swatmf_log` to the console as the
+executable writes it (init messages appear immediately; a dot is printed
+every 2 s during the time-stepping loop so you can see it is not hung).
+
+```{python}
+from swatmf.simulation import run_simulation_monitored, validate_simulation
+
+# Runs synchronously with live log output.
+# Raises RuntimeError on non-zero exit code with the full log tail + stderr.
+try:
+    proc = run_simulation_monitored(
+        swatmf_folder = run_dir,
+        # exe_name = "swatmf_rel230818.exe",  # uncomment to override auto-detection
+        poll_interval = 2.0,               # seconds between log checks
+    )
+except RuntimeError as e:
+    print("Simulation crashed:\n", e)
+```
+
+To run silently in the background (non-blocking) and check on it manually:
+
+```{python}
+# from swatmf.simulation import run_simulation
+# proc = run_simulation(run_dir, wait=False)
+# # … do other work …
+# proc.wait()
+# print("Done — return code:", proc.returncode)
+```
+
+### 3.7  Validate simulation outputs
+
+After the run, call `validate_simulation` to check whether the model
+completed and all expected output files are non-empty.  It reads
+`swatmf_log`, cross-references the active `swatmf_link.txt` flags, and
+reports the size of every expected output file.
+
+```{python}
+report = validate_simulation(run_dir, cfg=cfg)
+```
+
+The report tells you:
+
+| Section | What it checks |
+|---------|---------------|
+| **[1] Run log** | Whether `swatmf_log` ends with the completion marker; shows the last 15 lines on failure |
+| **[2] Required inputs** | `swatmf_link.txt`, `modflow.mfn`, `hru_dhru`, `dhru_grid`, `grid_dhru`, `modflow.obs` (if enabled) |
+| **[3] Output files** | Each file expected from the active flags — `output.rch`, `swatmf_out_MF_obs`, recharge, GW-SW, etc. — with file size |
+
+Files under 200 bytes are reported as **EMPTY** even if they exist — the
+executable writes a one-line header before running any timesteps, so a
+header-only file means the crash occurred during initialisation.
+
+If the log stops at **"MODFLOW files have been read"** without advancing to
+simulation, common causes are:
+
+| Symptom | Likely cause | Fix |
+|---------|-------------|-----|
+| Log ends at "MODFLOW files have been read" | Link-table mismatch — cell count in `grid_dhru` header doesn't match the `.dis` file | Re-run `generate_link_tables` and `copy_modflow_files` |
+| Log ends at "Observation cell file needed" | `modflow.obs` missing from `wd` | Run `copy_modflow_files` again |
+| `output.rch` empty, MODFLOW outputs non-empty | SWAT input files missing or corrupted | Check `file.cio` and SWAT `.sub`/`.rte` files |
+
+---
+
+## 4  Streamflow
+
+Simulated stream discharge is read from `output.rch`.  Observed data should
+be in a CSV file with a `date` column and one column per gauge, placed in
+`run_dir` alongside `output.rch`.
+
+Outputs are read from `run_dir` (the coupled run folder).
+
+```{python}
+import shutil, glob
+from swatmf.outputs.streamflow import (
+    get_streamflow, compute_statistics, plot_streamflow, export_streamflow
+)
+
+# ── User inputs — update to match your observed data ────────────────────────
+SUBBASIN   = 1          # subbasin number matching the observed data gauge
+TIMESCALE  = "Daily"    # 'Daily', 'Monthly', or 'Annual'
+
+# Place your observed streamflow CSV in run_dir and set the filename/column:
+OBD_FILE = "stf_day.obd.csv"   # filename only (looked up in run_dir)
+OBD_COL  = None                 # column name in the CSV, or None to skip obs
+
+# If the obs file lives elsewhere, copy it first:
+# shutil.copy("/path/to/stf_day.obd.csv", os.path.join(run_dir, OBD_FILE))
+# ────────────────────────────────────────────────────────────────────────────
+
+stf_df = get_streamflow(
+    swatmf_folder=run_dir,
+    subbasin=SUBBASIN,
+    start_date=start_str,
+    iprint=iprint,
+    timescale=TIMESCALE
+)
+
+stf_df.head()
+```
+
+### 4.1  Plot
+
+```{python}
+fig, ax = plot_streamflow(
+    df       = stf_df,
+    subbasin = SUBBASIN,
+    # obd_col  = OBD_COL,
+    timescale= TIMESCALE,
+)
+plt.show()
+```
+
+### 4.2  Performance metrics
+
+```{python}
+if OBD_COL is not None and OBD_COL in stf_df.columns:
+    stf_stats = compute_statistics(stf_df, obd_col=OBD_COL)
+    print(f"NSE   : {stf_stats['nse']:.4f}")
+    print(f"R²    : {stf_stats['rsq']:.4f}")
+    print(f"PBias : {stf_stats['pbias']:.4f} %")
+    print(f"RMSE  : {stf_stats['rmse']:.4f} m³/s")
+else:
+    stf_stats = None
+    print("No observed streamflow data loaded; skipping metrics.")
+```
+
+### 4.3  Export
+
+```{python}
+fpath = export_streamflow(
+    df=stf_df,
+    out_folder=out,
+    subbasin=SUBBASIN,
+    obd_col=OBD_COL or "",
+    timescale=TIMESCALE,
+    stats=stf_stats,
+)
+print("Exported to:", fpath)
+```
+
+---
+
+## 5  Groundwater Levels
+
+Simulated hydraulic heads are read from `swatmf_out_MF_obs` using the
+observation cell list in `modflow.obs`.
+
+> **Column names vs grid IDs** — CSV columns in observed depth-to-water files
+> are well identifiers, not MODFLOW cell IDs.  Use the grid IDs returned by
+> the spatial join in Section 2.3.
+
+```{python}
+from swatmf.outputs.groundwater import (
+    read_mf_obs, get_groundwater, compute_statistics as gw_stats,
+    plot_groundwater, export_groundwater
+)
+
+# ── User inputs — update to match your site ─────────────────────────────────
+# GRID_ID: the MODFLOW grid cell ID for the well of interest.
+# Leave as None to auto-select the first observation cell from modflow.obs.
+# (Set to a specific int once you know which cell you want, e.g. GRID_ID = 42)
+GRID_ID        = None     # ← None = auto-select; or set an int from modflow.obs
+GW_TIMESCALE   = "Daily"
+DEPTH_TO_WATER = True     # True → convert simulated head to depth-to-water
+
+# Place your observed groundwater CSV in run_dir and set the filename/column:
+GW_OBD_FILE = "dtw_day.obd.csv"
+GW_OBD_COL  = None        # column name in the CSV, or None to skip obs
+# shutil.copy("/path/to/dtw_day.obd.csv", os.path.join(run_dir, GW_OBD_FILE))
+# ────────────────────────────────────────────────────────────────────────────
+
+mf_obs_meta = read_mf_obs(run_dir)
+gw_df     = None
+gw_metrics = None
+
+if len(mf_obs_meta) == 0:
+    print("⚠  No observation wells defined (modflow.obs absent or empty).")
+    print("   Add observation cells to modflow.obs to enable GW-level output.")
+    print("   Sections 5.1–5.3 will be skipped.")
+else:
+    # Auto-select first obs cell when GRID_ID is not specified
+    if GRID_ID is None:
+        GRID_ID = int(mf_obs_meta.index[0])
+        print(f"GRID_ID not set — auto-selected first obs cell: {GRID_ID}")
+    if GRID_ID not in mf_obs_meta.index:
+        print(f"⚠  GRID_ID={GRID_ID} is not in modflow.obs "
+              f"(available: {mf_obs_meta.index.tolist()}). Skipping GW section.")
+        mf_obs_meta = mf_obs_meta.iloc[0:0]   # force empty so blocks below skip
+    else:
+        print(f"Observation cells defined in modflow.obs: {mf_obs_meta.index.tolist()}")
+```
+
+```{python}
+if len(mf_obs_meta) > 0 and GRID_ID is not None:
+    gw_df = get_groundwater(
+        swatmf_folder  = run_dir,
+        grid_id        = GRID_ID,
+        start_date     = start_str,
+        timescale      = GW_TIMESCALE,
+        depth_to_water = DEPTH_TO_WATER,
+        obd_file       = GW_OBD_FILE if GW_OBD_COL is not None else None,
+        obd_col        = GW_OBD_COL,
+    )
+    gw_df.head()
+else:
+    print("Skipped — no observation cells available.")
+```
+
+### 5.1  Plot
+
+```{python}
+if gw_df is not None:
+    _gw_obd_col = GW_OBD_COL if (GW_OBD_COL and GW_OBD_COL in gw_df.columns) else None
+    fig, ax = plot_groundwater(
+        df=gw_df,
+        grid_id=GRID_ID,
+        obd_col=_gw_obd_col,
+        timescale=GW_TIMESCALE,
+        depth_to_water=DEPTH_TO_WATER,
+    )
+    plt.show()
+else:
+    print("Skipped — no GW data available.")
+```
+
+### 5.2  Performance metrics
+
+```{python}
+if gw_df is not None and GW_OBD_COL is not None and GW_OBD_COL in gw_df.columns:
+    gw_metrics = gw_stats(gw_df, grid_id=GRID_ID, obd_col=GW_OBD_COL)
+    print(f"NSE   : {gw_metrics['nse']:.4f}")
+    print(f"R²    : {gw_metrics['rsq']:.4f}")
+    print(f"PBIAS : {gw_metrics['pbias']:.4f} %")
+    print(f"RMSE  : {gw_metrics['rmse']:.4f} m")
+else:
+    gw_metrics = None
+    print("No observed groundwater data loaded; skipping metrics.")
+```
+
+### 5.3  Export
+
+```{python}
+if gw_df is not None:
+    fpath = export_groundwater(
+        df=gw_df,
+        out_folder=out,
+        grid_id=GRID_ID,
+        obd_col=GW_OBD_COL or "",
+        timescale=GW_TIMESCALE,
+        stats=gw_metrics,
+    )
+    print("Exported to:", fpath)
+else:
+    print("Skipped — no GW data to export.")
+```
+
+---
+
+## 6  MODFLOW Recharge
+
+Gridded recharge values (one value per MODFLOW grid cell, per time step) are
+read from `swatmf_out_MF_recharge*`.
+
+> **Note:** The number of grid cells (`N_CELLS`) must be specified because
+> the output file is written without an explicit row count.  You can obtain
+> this from `dis.n_cells` (Section 2.2) or from the `mf_grid` shapefile.
+
+```{python}
+from swatmf.outputs.recharge import (
+    read_recharge_dates, get_recharge,
+    average_monthly_recharge,
+    plot_recharge_timeseries, plot_avg_monthly_recharge
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+# N_CELLS must equal the number of active MODFLOW grid cells.
+# Use dis.n_cells from Section 2.2 (Scenario A), or the row count of the
+# active-cell mask from your BAS file.
+N_CELLS       = dis.n_cells   # derived from the parsed .dis file above
+RCH_TIMESCALE = "Monthly"     # 'Daily', 'Monthly', or 'Annual'
+# ────────────────────────────────────────────────────────────────────────────
+
+print(f"Active MODFLOW cells: {N_CELLS}")
+rch_dates = read_recharge_dates(run_dir, timescale=RCH_TIMESCALE, start_date=start_mdy)
+print(f"Available {RCH_TIMESCALE.lower()} recharge steps: {len(rch_dates)}")
+print(f"  First: {rch_dates[0]}   Last: {rch_dates[-1]}")
+```
+
+```{python}
+rch_df = get_recharge(
+    swatmf_folder = run_dir,
+    n_cells       = N_CELLS,
+    start_date    = start_mdy,
+    timescale     = RCH_TIMESCALE,
+)
+
+print(rch_df.shape)  # (n_dates, n_cells)
+rch_df.iloc[:5, :5]
+```
+
+### 6.1  Spatial mean recharge over time
+
+```{python}
+fig, ax = plot_recharge_timeseries(rch_df)
+plt.show()
+```
+
+### 6.2  Average monthly recharge
+
+```{python}
+if RCH_TIMESCALE == "Monthly":
+    avg_rch = average_monthly_recharge(rch_df)
+    fig, ax = plot_avg_monthly_recharge(avg_rch)
+    plt.show()
+```
+
+---
+
+## 7  Groundwater–Surface-Water Exchange
+
+GW-SW exchange fluxes are read from `swatmf_out_MF_gwsw*`.  Positive values
+indicate groundwater discharge to the stream; negative values indicate stream
+losses to the aquifer.
+
+> **Note:** GW-SW exchange coupling requires a `river_grid` table from GIS
+> preprocessing (intersecting the stream network with the MODFLOW grid and
+> subbasin polygons) to build `swatmf_river2grid.txt`.  Without it the output
+> file contains 0 river cells per time step and `gwsw_df` will be empty.
+> GW-SW output requires a non-empty `river_grid` table from Section 2.4.
+> If no river cells were found, `gwsw_df` will be empty.
+
+```{python}
+from swatmf.outputs.gwsw import (
+    read_gwsw_dates, get_gwsw,
+    gwsw_basin_total,
+    plot_gwsw_timeseries, export_gwsw
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+# get_gwsw() auto-detects the actual river-cell count from the output file,
+# so any value of N_RIV_CELLS is safe (a warning is issued if it differs).
+N_RIV_CELLS    = len(riv_df) if riv_df is not None else 0   # from Section 2.4
+GWSW_TIMESCALE = "Daily"       # 'Daily', 'Monthly', or 'Annual'
+# ────────────────────────────────────────────────────────────────────────────
+
+gwsw_dates = read_gwsw_dates(run_dir, timescale=GWSW_TIMESCALE, start_date=start_mdy)
+print(f"Available {GWSW_TIMESCALE.lower()} GW-SW steps: {len(gwsw_dates)}")
+```
+
+```{python}
+gwsw_df = get_gwsw(
+    swatmf_folder = run_dir,
+    n_riv_cells   = N_RIV_CELLS,
+    start_date    = start_mdy,
+    timescale     = GWSW_TIMESCALE,
+)
+
+if gwsw_df.empty:
+    print("No GW-SW data available (0 river cells in output).")
+    print("Provide a 'river_grid' GIS table to enable GW-SW coupling.")
+else:
+    print(gwsw_df.shape)  # (n_dates, n_river_cells)
+    display(gwsw_df.head())
+```
+
+### 7.1  Basin total GW-SW exchange
+
+```{python}
+if not gwsw_df.empty:
+    fig, ax = plot_gwsw_timeseries(gwsw_df, timescale=GWSW_TIMESCALE)
+else:
+    print("Skipped — no GW-SW data.")
+```
+
+### 7.2  Export
+
+```{python}
+if not gwsw_df.empty:
+    fpath = export_gwsw(gwsw_df, out, timescale=GWSW_TIMESCALE)
+    print("Exported to:", fpath)
+else:
+    print("Skipped — no GW-SW data.")
+```
+
+---
+
+## 8  Water Balance
+
+The SWAT water balance is read from `output.std`.
+
+```{python}
+from swatmf.outputs.water_balance import (
+    get_water_balance, plot_water_balance, export_water_balance
+)
+
+# ── User inputs ─────────────────────────────────────────────────────────────
+WB_TIMESCALE = "Daily"  # 'Daily', 'Monthly', or 'Annual'
+# ────────────────────────────────────────────────────────────────────────────
+
+wb_df = get_water_balance(
+    swatmf_folder = run_dir,
+    start_date    = sp.start_date_warmup,
+    end_year      = end_year,
+    iprint        = iprint,
+    timescale     = WB_TIMESCALE,
+)
+
+wb_df.head()
+```
+
+### 8.1  Four-panel water balance plot
+
+```{python}
+fig, axes = plot_water_balance(wb_df, timescale=WB_TIMESCALE)
+plt.show()
+```
+
+### 8.2  Export
+
+```{python}
+fpath = export_water_balance(wb_df, out, timescale=WB_TIMESCALE)
+print("Exported to:", fpath)
+```
+
+---
+
+## 9  RT3D — Reactive Transport Post-Processing
+
+This section reads and visualises the RT3D concentration outputs produced by
+the SWAT-MODFLOW-RT3D coupled model.  It is only relevant when
+`cfg.rt3d_active = True` was set in Section 3.
+
+### 9.1  Read concentration grids
+
+```{python}
+from swatmf.outputs.rt3d import read_rt3d_conc, plot_conc_map
+
+# Read monthly NO₃ concentrations
+try:
+    no3_monthly = read_rt3d_conc(
+        run_dir,
+        species="no3",
+        freq="monthly",
+        start_date=sp.start_date_warmup.strftime("%Y-%m-%d"),
+    )
+    print(f"NO₃ monthly: {len(no3_monthly)} time steps loaded")
+    # Show grid shape of first time step
+    first_key = list(no3_monthly.keys())[0]
+    print(f"  Grid shape: {no3_monthly[first_key].shape}")
+except FileNotFoundError as e:
+    no3_monthly = None
+    print(f"⚠ {e}")
+```
+
+```{python}
+# Read monthly P concentrations
+try:
+    p_monthly = read_rt3d_conc(
+        run_dir,
+        species="p",
+        freq="monthly",
+        start_date=sp.start_date_warmup.strftime("%Y-%m-%d"),
+    )
+    print(f"P monthly: {len(p_monthly)} time steps loaded")
+except FileNotFoundError as e:
+    p_monthly = None
+    print(f"⚠ {e}")
+```
+
+### 9.2  Concentration maps
+
+```{python}
+import matplotlib.pyplot as plt
+
+if no3_monthly:
+    # Plot last available month
+    last_key = list(no3_monthly.keys())[-1]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    plot_conc_map(no3_monthly[last_key], title=f"NO₃ — {last_key}",
+                  cmap="YlOrRd", ax=axes[0])
+
+    if p_monthly:
+        last_key_p = list(p_monthly.keys())[-1]
+        plot_conc_map(p_monthly[last_key_p], title=f"P — {last_key_p}",
+                      cmap="YlGnBu", ax=axes[1])
+
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No RT3D concentration output available — skipping maps.")
+```
+
+### 9.3  GW–SW nutrient exchange
+
+```{python}
+from swatmf.outputs.rt3d import read_rt3d_rivflux, plot_rivflux_ts
+
+try:
+    no3_flux = read_rt3d_rivflux(
+        run_dir, species="no3", by="subbasin",
+        start_date=sp.start_date_warmup.strftime("%Y-%m-%d"),
+    )
+    ax = plot_rivflux_ts(no3_flux, species="NO₃")
+    plt.tight_layout()
+    plt.show()
+    print(f"NO₃ GW-SW flux: {len(no3_flux)} time steps, "
+          f"{no3_flux.shape[1]} subbasins")
+except FileNotFoundError as e:
+    no3_flux = None
+    print(f"⚠ {e}")
+```
+
+```{python}
+try:
+    p_flux = read_rt3d_rivflux(
+        run_dir, species="p", by="subbasin",
+        start_date=sp.start_date_warmup.strftime("%Y-%m-%d"),
+    )
+    ax = plot_rivflux_ts(p_flux, species="P")
+    plt.tight_layout()
+    plt.show()
+except FileNotFoundError as e:
+    p_flux = None
+    print(f"⚠ {e}")
+```
+
+### 9.4  Recharge nutrient concentrations
+
+```{python}
+from swatmf.outputs.rt3d import read_rt3d_recharge_conc
+
+try:
+    rech_no3 = read_rt3d_recharge_conc(
+        run_dir, species="no3", by="subbasin",
+        start_date=sp.start_date_warmup.strftime("%Y-%m-%d"),
+    )
+    print(f"NO₃ recharge conc: {len(rech_no3)} time steps, "
+          f"{rech_no3.shape[1]} subbasins")
+    print(rech_no3.describe().round(4))
+except FileNotFoundError as e:
+    rech_no3 = None
+    print(f"⚠ {e}")
+```
+
+---
+
+## 10  Performance Metrics Summary
+
+Aggregate all available metrics into a single summary table.
+
+```{python}
+import pandas as pd
+
+records = []
+
+if stf_stats is not None:
+    records.append({
+        "Variable": f"Streamflow (subbasin {SUBBASIN})",
+        "Timescale": TIMESCALE,
+        "NSE":   round(stf_stats["nse"],   4),
+        "R²":    round(stf_stats["rsq"],   4),
+        "PBIAS": round(stf_stats["pbias"], 4),
+        "RMSE":  round(stf_stats["rmse"],  4),
+    })
+
+if locals().get("gw_metrics") is not None:
+    records.append({
+        "Variable": f"Groundwater Level (grid {locals().get('GRID_ID', '?')})",
+        "Timescale": locals().get("GW_TIMESCALE", "Daily"),
+        "NSE":   round(gw_metrics["nse"],   4),
+        "R²":    round(gw_metrics["rsq"],   4),
+        "PBIAS": round(gw_metrics["pbias"], 4),
+        "RMSE":  round(gw_metrics["rmse"],  4),
+    })
+
+if records:
+    summary = pd.DataFrame(records).set_index("Variable")
+    display(summary)
+else:
+    print("No observed data was loaded; no statistics to summarise.")
+```
+
+---
+
+## Appendix — Package structure
+
+```
+swatmf/
+├── __init__.py              # exposes Paths, parse_file_cio
+├── paths.py                 # Paths class (replaces dirs_and_paths)
+├── sim_period.py            # parse_file_cio (replaces define_sim_period)
+├── metrics.py               # nse, rmse, pbias, rsq, all_metrics
+├── simulation.py            # SwatmfLinkConfig, write/read swatmf_link.txt
+├── preprocessing/
+│   ├── __init__.py
+│   ├── modflow.py           # parse_dis_file, create_mf_model, modflow.obs, etc.
+│   ├── linking.py           # generate_link_tables (hru_dhru, dhru_grid)
+│   └── rt3d.py             # RT3DConfig, write_rt3d_model (BTN/DSP/RCT/GCG/ADV/SSM)
+└── outputs/
+    ├── __init__.py
+    ├── streamflow.py        # post_i_sw.py  → get_streamflow, plot_streamflow
+    ├── groundwater.py       # post_ii_gw.py → get_groundwater, plot_groundwater
+    ├── recharge.py          # post_iii_rch.py → get_recharge, plot_recharge_*
+    ├── gwsw.py              # post_iv_gwsw.py → get_gwsw, plot_gwsw_timeseries
+    ├── water_balance.py     # post_v_wb.py → get_water_balance, plot_water_balance
+    └── rt3d.py              # post_vii_nitrate.py → read_rt3d_conc, plot_conc_map
+```
+
+### Correspondence to QSWATMOD2 plugin tabs
+
+| Workflow step | Plugin tab / module | `swatmf` module |
+|---|---|---|
+| Project paths | `QSWATMOD2.dirs_and_paths` | `swatmf.paths.Paths` |
+| Simulation period | `QSWATMOD2.define_sim_period` | `swatmf.sim_period.parse_file_cio` |
+| MODFLOW grid / model | **Pre-Processing** / `modflow_functions.py` | `swatmf.preprocessing.modflow` |
+| Build MF model (flopy) | **Pre-Processing** / `writeMF.writeMFmodel` | `swatmf.preprocessing.modflow.create_mf_model` |
+| modflow.obs | **Pre-Processing** / `modflow_functions.export_modflow_obs` | `swatmf.preprocessing.modflow.create_modflow_obs` |
+| River connections | **Pre-Processing** / `modflow_functions.mf_riv*` | `swatmf.preprocessing.modflow.parse_riv_file` |
+| RT3D input files | **Pre-Processing** / `write_rt3d.write_rt3d_inputs` | `swatmf.preprocessing.rt3d.write_rt3d_model` |
+| swatmf_link.txt | **Simulation** / `runSim_link.create_swatmf_link` | `swatmf.simulation.write_swatmf_link` |
+| Streamflow | **Post-Processing** / `post_i_sw.py` | `swatmf.outputs.streamflow` |
+| Groundwater levels | **Post-Processing** / `post_ii_gw.py` | `swatmf.outputs.groundwater` |
+| MODFLOW recharge | **Post-Processing** / `post_iii_rch.py` | `swatmf.outputs.recharge` |
+| GW-SW exchange | **Post-Processing** / `post_iv_gwsw.py` | `swatmf.outputs.gwsw` |
+| Water balance | **Post-Processing** / `post_v_wb.py` | `swatmf.outputs.water_balance` |
+| RT3D concentrations | **Post-Processing** / `post_vii_nitrate.py` | `swatmf.outputs.rt3d` |
+| Objective functions | `pyfolder/utils.py ObjFns` | `swatmf.metrics` |

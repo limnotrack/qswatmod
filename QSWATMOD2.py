@@ -1835,12 +1835,23 @@ class QSWATMOD2(object):
     #     for sub in subbasin_list:
     #         subbasin_list_1.extend(sub)
 
-    def createMF(self):
+    def createMF(self, silent=False):
+        QSWATMOD_path_dict = self.dirs_and_paths()
+        has_dis = any(file.endswith(".dis") for file in os.listdir(QSWATMOD_path_dict['SMfolder']))
         self.dlg.progressBar_sm_link.setValue(0)
-        modflow_functions.MF_grid(self)
-        self.dlg.progressBar_sm_link.setValue(20)
-        QCoreApplication.processEvents()
-        
+        if self.dlg.mf_option_2.isChecked():
+            modflow_functions.MF_grid(self)
+            self.dlg.progressBar_sm_link.setValue(20)
+            QCoreApplication.processEvents()
+        elif self.dlg.mf_option_1.isChecked() or self.dlg.mf_option_3.isChecked():
+            if not self.prepare_existing_mf_grid():
+                return False
+            self.dlg.progressBar_sm_link.setValue(20)
+            QCoreApplication.processEvents()
+        else:
+            self.main_messageBox("Select option", "Please select one MODFLOW option first.")
+            return False
+
         modflow_functions.create_grid_id(self)
         self.dlg.progressBar_sm_link.setValue(60)
         QCoreApplication.processEvents()
@@ -1848,12 +1859,16 @@ class QSWATMOD2(object):
         modflow_functions.create_row(self)
         self.dlg.progressBar_sm_link.setValue(70)
         QCoreApplication.processEvents()
-        
+
         modflow_functions.create_col(self)
         self.dlg.progressBar_sm_link.setValue(80)
         QCoreApplication.processEvents()
-        
-        modflow_functions.create_top_elev(self)
+
+        if has_dis:
+            modflow_functions.create_top_elev(self)
+        else:
+            time = datetime.now().strftime('[%m/%d/%y %H:%M:%S]')
+            self.dlg.textEdit_sm_link_log.append(time+' -> ' + "No .dis file found; skipping 'top_elev' creation.")
         self.dlg.progressBar_sm_link.setValue(100)
         QCoreApplication.processEvents()
         ### Use the "use_sub_shapefile" function from CreateMFmodel_dialog --> not working
@@ -1861,17 +1876,50 @@ class QSWATMOD2(object):
         # class_mf = createMFmodelDialog(self) # make the class the object
         # class_mf.use_sub_shapefile()
         # time = datetime.now().strftime('[%m/%d/%y %H:%M:%S]')
-        msgBox = QMessageBox()
-        msgBox.setWindowIcon(QtGui.QIcon(':/QSWATMOD2/pics/sm_icon.png'))
-        msgBox.setWindowTitle("Created!")
-        msgBox.setText("'mf_grid' shapefile was created!")
-        msgBox.exec_()
+        if not silent:
+            msgBox = QMessageBox()
+            msgBox.setWindowIcon(QtGui.QIcon(':/QSWATMOD2/pics/sm_icon.png'))
+            msgBox.setWindowTitle("Created!")
+            msgBox.setText("'mf_grid.gpkg' was created/prepared!")
+            msgBox.exec_()
+        return True
+
+    def prepare_existing_mf_grid(self):
+        QSWATMOD_path_dict = self.dirs_and_paths()
+        output_file = os.path.join(QSWATMOD_path_dict['org_shps'], 'mf_grid.gpkg')
+        layers = QgsProject.instance().mapLayersByName("mf_grid (MODFLOW)")
+        if not layers:
+            self.main_messageBox("Missing layer", "Please import or create the MODFLOW grid first.")
+            return False
+        layer = layers[0]
+        params = {
+            'INPUT': layer.source(),
+            'OUTPUT': output_file
+        }
+        processing.run('native:fixgeometries', params)
+        for lyr in list(QgsProject.instance().mapLayers().values()):
+            if lyr.name() == ("mf_grid (MODFLOW)"):
+                QgsProject.instance().removeMapLayers([lyr.id()])
+        layer = QgsVectorLayer(output_file, '{0} ({1})'.format("mf_grid", "MODFLOW"), 'ogr')
+        root = QgsProject.instance().layerTreeRoot()
+        mf_group = root.findGroup("MODFLOW")
+        if mf_group is None:
+            mf_group = root.insertGroup(0, "MODFLOW")
+        QgsProject.instance().addMapLayer(layer, False)
+        mf_group.insertChildNode(0, QgsLayerTreeLayer(layer))
+        self.dlg.lineEdit_MODFLOW_grid_shapefile.setText(output_file)
+        return True
 
     def geoprocessing_prepared(self):
         from datetime import datetime
         self.dlg.checkBox_filesPrepared.setChecked(0)
         self.dlg.progressBar_sm_link.setValue(0)
         self.dlg.textEdit_sm_link_log.append('======== Start Linking Process =========')
+        if self.mf_option_needs_preparation():
+            self.dlg.textEdit_sm_link_log.append("Preparing MODFLOW grid from selected option ...")
+            if not self.createMF(silent=True):
+                self.dlg.textEdit_sm_link_log.append("Grid preparation failed — linking aborted.")
+                return
         
         # Create hru_dhru
         linking_process.hru_dhru(self)
@@ -1914,23 +1962,18 @@ class QSWATMOD2(object):
         msgBox.setText("Linking process has been completed successfully!")
         msgBox.exec_()
 
-        questionBox = QMessageBox()
-        questionBox.setWindowIcon(QtGui.QIcon(':/QSWATMOD2/pics/sm_icon.png'))
-        reply = QMessageBox.question(
-                            questionBox, 'Create?',
-                            'Do you wish to create the linkage files?', QMessageBox.Yes, QMessageBox.No)
-        if reply == QMessageBox.Yes:
-            linking_process.run_CreateSWATMF(self)
-            linking_process.copylinkagefiles(self)
-            msgBox.setWindowTitle("Exported!")
-            msgBox.setWindowIcon(QtGui.QIcon(':/QSWATMOD2/pics/sm_icon.png'))
-            msgBox.setText("Linkage files have been exported to your SWAT-MODFLOW folder!")
-            msgBox.exec_()
-            self.dlg.tabWidget.setTabEnabled(2, True)
-        '''
-        '''
-
-        self.define_sim_period()
+    def mf_option_needs_preparation(self):
+        QSWATMOD_path_dict = self.dirs_and_paths()
+        layers = QgsProject.instance().mapLayersByName("mf_grid (MODFLOW)")
+        if not layers:
+            return True
+        required = {"grid_id", "row", "col"}
+        field_names = set(field.name() for field in layers[0].fields())
+        if not required.issubset(field_names):
+            return True
+        if not os.path.exists(os.path.join(QSWATMOD_path_dict['org_shps'], "mf_grid.gpkg")):
+            return True
+        return False
 
     # NOTE: let's use the latest version of SWAT-MODFLOW3
     # https://github.com/spark-brc/SWAT-MODFLOW3

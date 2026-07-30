@@ -1,0 +1,51 @@
+"""
+swatmf
+======
+A pure-Python package for scripted SWAT-MODFLOW pre-processing and
+post-processing workflows.
+
+This package replicates the analysis and visualisation logic of the QSWATMOD2
+QGIS plugin without requiring QGIS, PyQt, or any other GUI dependency.  All
+functions operate directly on the input and output files produced by the
+SWAT-MODFLOW executable.
+
+Modules
+-------
+paths                        : project directory/path management
+sim_period                   : simulation period parsing (file.cio)
+metrics                      : objective functions (NSE, RMSE, PBias, R²)
+preprocessing.modflow        : parse/write MODFLOW files; build new MF model; check MODFLOW folder
+preprocessing.linking        : generate hru_dhru, dhru_grid, and grid_dhru link tables
+simulation                   : read/write swatmf_link.txt; copy link files; run executable
+outputs/streamflow           : read & visualise output.rch
+outputs/groundwater          : read & visualise swatmf_out_MF_obs
+outputs/recharge             : read swatmf_out_MF_recharge* files
+outputs/gwsw                 : read swatmf_out_MF_gwsw* files
+outputs/water_balance        : read output.std
+epm                          : EPM transit-time lag correction (Rotorua catchment)
+"""
+
+__version__ = "0.1.0"
+# Version string used in exported file headers to match the QSWATMOD2 plugin convention
+_EXPORT_VERSION = "version 2.10.1."
+
+from .paths import Paths
+from .sim_period import parse_file_cio
+from .simulation import validate_simulation, run_simulation_monitored
+from .epm import (
+    EPMParams, ROTORUA_EPM,
+    epm_kernel, binary_epm_kernel,
+    apply_epm_lag, apply_epm_lag_df, apply_epm_lag_spatial,
+    lag_rivflux, lag_recharge_conc,
+    assign_stream_params, kernel_summary, plot_kernel,
+    compare_epm_vs_rt3d, epm_coverage_fraction,
+)
+
+__all__ = [
+    "Paths", "parse_file_cio", "validate_simulation", "run_simulation_monitored",
+    "EPMParams", "ROTORUA_EPM",
+    "epm_kernel", "binary_epm_kernel",
+    "apply_epm_lag", "apply_epm_lag_df", "apply_epm_lag_spatial",
+    "lag_rivflux", "lag_recharge_conc",
+    "assign_stream_params", "kernel_summary", "plot_kernel",
+]
